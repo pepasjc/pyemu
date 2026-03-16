@@ -28,3 +28,4 @@ SLOT/
 *.zip
 *.sav
 *.pystate
+python/*.egg-info/
