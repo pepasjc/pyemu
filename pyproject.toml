@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyemu"
+version = "0.1.0"
+description = "Educational C-based emulator scaffold with a PySide6 UI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cffi>=1.16",
+    "pygame>=2.6",
+    "PySide6>=6.7",
+]
+
+[project.scripts]
+pyemu = "pyemu.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.uv]
+package = true
