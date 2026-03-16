@@ -122,8 +122,8 @@ class Emulator:
             self._backend = _FallbackEmulator(self._system)
             self.native_available = False
         else:
-            ffi, lib = native
-            self._backend = _NativeEmulator(self._system, ffi, lib)
+            ffi, lib, library_path = native
+            self._backend = _NativeEmulator(self._system, ffi, lib, str(library_path))
             self.native_available = True
 
     @property
@@ -153,6 +153,10 @@ class Emulator:
     @property
     def cycle_count(self) -> int:
         return self._backend.cycle_count
+
+    @property
+    def native_library_path(self) -> str:
+        return getattr(self._backend, "native_library_path", "")
 
     @property
     def faulted(self) -> bool:
@@ -266,13 +270,18 @@ class Emulator:
 
 
 class _NativeEmulator:
-    def __init__(self, system: SystemInfo, ffi: FFI, lib) -> None:
+    def __init__(self, system: SystemInfo, ffi: FFI, lib, library_path: str) -> None:
         self._system = system
         self._ffi = ffi
         self._lib = lib
+        self._library_path = library_path
         self._handle = _create_native_emulator(ffi, lib, system.key)
         if self._handle == ffi.NULL:
             raise RuntimeError(f"Failed to create native emulator for {system.key}")
+
+    @property
+    def native_library_path(self) -> str:
+        return self._library_path
 
     @property
     def system_name(self) -> str:
@@ -531,7 +540,7 @@ def _create_native_emulator(ffi: FFI, lib, system_key: str):
     return lib.pyemu_create_gameboy()
 
 
-def _load_native_library() -> tuple[FFI, object] | None:
+def _load_native_library() -> tuple[FFI, object, Path] | None:
     ffi = FFI()
     ffi.cdef(
         """
@@ -625,7 +634,7 @@ def _load_native_library() -> tuple[FFI, object] | None:
 
     for candidate in _library_candidates():
         if candidate.exists():
-            return ffi, ffi.dlopen(str(candidate))
+            return ffi, ffi.dlopen(str(candidate)), candidate
     return None
 
 
@@ -634,6 +643,10 @@ def _library_candidates() -> list[Path]:
     workspace_root = package_root.parent.parent
     if sys.platform.startswith("win"):
         return [
+            workspace_root / "build" / "native" / "pyemu_native_timed108.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed107.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed106.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed104.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed103.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed97.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed96.dll",

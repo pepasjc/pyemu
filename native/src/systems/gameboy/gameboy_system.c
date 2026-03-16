@@ -241,6 +241,7 @@ static void pyemu_gameboy_tick(pyemu_gameboy_system* gb, int cycles);
 static void pyemu_gameboy_update_stat(pyemu_gameboy_system* gb);
 static uint8_t pyemu_gameboy_stat_irq_signal(uint8_t stat, uint8_t coincidence, uint8_t mode);
 static void pyemu_gameboy_latch_scanline_registers(pyemu_gameboy_system* gb, uint8_t ly);
+static void pyemu_gameboy_render_scanline(pyemu_gameboy_system* gb, uint8_t y);
 static void pyemu_gameboy_update_demo_frame(pyemu_gameboy_system* gb);
 static void pyemu_gameboy_step_instruction_internal(pyemu_gameboy_system* gb, int render_frame);
 static void pyemu_gameboy_get_cartridge_debug_info(const pyemu_system* system, pyemu_cartridge_debug_info* out_info);
@@ -1193,103 +1194,121 @@ static void pyemu_gameboy_apply_timer_edge(pyemu_gameboy_system* gb, int old_sig
     }
 }
 
-static void pyemu_gameboy_update_demo_frame(pyemu_gameboy_system* gb) {
+static void pyemu_gameboy_render_scanline(pyemu_gameboy_system* gb, uint8_t y) {
     int x;
-    int y;
     int sprite_index;
+    uint8_t lcdc;
+    uint8_t scy;
+    uint8_t scx;
+    uint8_t wy;
+    uint8_t wx;
+    uint8_t bgp;
+    uint8_t obp0;
+    uint8_t obp1;
+
+    if (y >= PYEMU_GAMEBOY_HEIGHT) {
+        return;
+    }
+
+    lcdc = gb->line_lcdc[y];
+    scy = gb->line_scy[y];
+    scx = gb->line_scx[y];
+    wy = gb->line_wy[y];
+    wx = gb->line_wx[y];
+    bgp = gb->line_bgp[y];
+    obp0 = gb->line_obp0[y];
+    obp1 = gb->line_obp1[y];
+
+    for (x = 0; x < PYEMU_GAMEBOY_WIDTH; ++x) {
+        size_t pixel = (size_t)(y * PYEMU_GAMEBOY_WIDTH + x) * 4U;
+        uint8_t shade = 0xCC;
+        uint8_t bg_color_id = 0;
+
+        if (gb->rom_loaded && (lcdc & 0x01)) {
+            uint8_t map_x = (uint8_t)(x + scx);
+            uint8_t map_y = (uint8_t)(y + scy);
+            uint16_t bg_map_base = (lcdc & 0x08) ? 0x9C00 : 0x9800;
+            uint16_t tile_map_address = (uint16_t)(bg_map_base + ((map_y / 8) * 32) + (map_x / 8));
+            uint8_t tile_index = pyemu_gameboy_read_memory(gb, tile_map_address);
+
+            bg_color_id = pyemu_gameboy_tile_pixel(gb, lcdc, tile_index, map_x, map_y, 0);
+            shade = pyemu_gameboy_apply_palette(bgp, bg_color_id);
+
+            if ((lcdc & 0x20) && y >= wy && (int)x >= ((int)wx - 7)) {
+                uint8_t win_x = (uint8_t)(x - ((int)wx - 7));
+                uint8_t win_y = (uint8_t)(y - wy);
+                uint16_t win_map_base = (lcdc & 0x40) ? 0x9C00 : 0x9800;
+                uint16_t win_tile_map_address = (uint16_t)(win_map_base + ((win_y / 8) * 32) + (win_x / 8));
+                uint8_t win_tile_index = pyemu_gameboy_read_memory(gb, win_tile_map_address);
+                bg_color_id = pyemu_gameboy_tile_pixel(gb, lcdc, win_tile_index, win_x, win_y, 0);
+                shade = pyemu_gameboy_apply_palette(bgp, bg_color_id);
+            }
+        } else if (gb->rom_loaded) {
+            shade = gb->memory[(uint16_t)(0x9800 + ((x / 8) + ((y / 8) * 32)) % 0x0400)];
+        } else {
+            shade = (uint8_t)((x + y + gb->cpu.a + pyemu_gameboy_read_memory(gb, PYEMU_IO_LY)) % 255);
+        }
+
+        if (lcdc & 0x02) {
+            int sprite_height = (lcdc & 0x04) ? 16 : 8;
+            for (sprite_index = 0; sprite_index < 40; ++sprite_index) {
+                uint16_t oam = (uint16_t)(0xFE00 + sprite_index * 4);
+                int sprite_y = (int)pyemu_gameboy_read_memory(gb, oam) - 16;
+                int sprite_x = (int)pyemu_gameboy_read_memory(gb, (uint16_t)(oam + 1)) - 8;
+                uint8_t tile = pyemu_gameboy_read_memory(gb, (uint16_t)(oam + 2));
+                uint8_t attrs = pyemu_gameboy_read_memory(gb, (uint16_t)(oam + 3));
+                uint8_t sprite_color_id;
+                uint8_t sprite_palette;
+                uint8_t sx;
+                uint8_t sy;
+
+                if (x < sprite_x || x >= sprite_x + 8 || y < sprite_y || y >= sprite_y + sprite_height) {
+                    continue;
+                }
+
+                sx = (uint8_t)(x - sprite_x);
+                sy = (uint8_t)(y - sprite_y);
+                if (attrs & 0x20) {
+                    sx = (uint8_t)(7 - sx);
+                }
+                if (attrs & 0x40) {
+                    sy = (uint8_t)(sprite_height - 1 - sy);
+                }
+
+                if (sprite_height == 16) {
+                    tile &= 0xFE;
+                    if (sy >= 8) {
+                        tile = (uint8_t)(tile + 1);
+                        sy = (uint8_t)(sy - 8);
+                    }
+                }
+
+                sprite_color_id = pyemu_gameboy_tile_pixel(gb, lcdc, tile, sx, sy, 1);
+                if (sprite_color_id == 0) {
+                    continue;
+                }
+                if ((attrs & 0x80) && bg_color_id != 0) {
+                    continue;
+                }
+
+                sprite_palette = (attrs & 0x10) ? obp1 : obp0;
+                shade = pyemu_gameboy_apply_palette(sprite_palette, sprite_color_id);
+                break;
+            }
+        }
+
+        gb->frame[pixel + 0] = shade;
+        gb->frame[pixel + 1] = shade;
+        gb->frame[pixel + 2] = shade;
+        gb->frame[pixel + 3] = 255;
+    }
+}
+
+static void pyemu_gameboy_update_demo_frame(pyemu_gameboy_system* gb) {
+    int y;
 
     for (y = 0; y < PYEMU_GAMEBOY_HEIGHT; ++y) {
-        uint8_t lcdc = gb->line_lcdc[y];
-        uint8_t scy = gb->line_scy[y];
-        uint8_t scx = gb->line_scx[y];
-        uint8_t wy = gb->line_wy[y];
-        uint8_t wx = gb->line_wx[y];
-        uint8_t bgp = gb->line_bgp[y];
-        uint8_t obp0 = gb->line_obp0[y];
-        uint8_t obp1 = gb->line_obp1[y];
-        for (x = 0; x < PYEMU_GAMEBOY_WIDTH; ++x) {
-            size_t pixel = (size_t)(y * PYEMU_GAMEBOY_WIDTH + x) * 4U;
-            uint8_t shade = 0xCC;
-            uint8_t bg_color_id = 0;
-
-            if (gb->rom_loaded && (lcdc & 0x01)) {
-                uint8_t map_x = (uint8_t)(x + scx);
-                uint8_t map_y = (uint8_t)(y + scy);
-                uint16_t bg_map_base = (lcdc & 0x08) ? 0x9C00 : 0x9800;
-                uint16_t tile_map_address = (uint16_t)(bg_map_base + ((map_y / 8) * 32) + (map_x / 8));
-                uint8_t tile_index = pyemu_gameboy_read_memory(gb, tile_map_address);
-
-                bg_color_id = pyemu_gameboy_tile_pixel(gb, lcdc, tile_index, map_x, map_y, 0);
-                shade = pyemu_gameboy_apply_palette(bgp, bg_color_id);
-
-                if ((lcdc & 0x20) && y >= wy && (int)x >= ((int)wx - 7)) {
-                    uint8_t win_x = (uint8_t)(x - ((int)wx - 7));
-                    uint8_t win_y = (uint8_t)(y - wy);
-                    uint16_t win_map_base = (lcdc & 0x40) ? 0x9C00 : 0x9800;
-                    uint16_t win_tile_map_address = (uint16_t)(win_map_base + ((win_y / 8) * 32) + (win_x / 8));
-                    uint8_t win_tile_index = pyemu_gameboy_read_memory(gb, win_tile_map_address);
-                    bg_color_id = pyemu_gameboy_tile_pixel(gb, lcdc, win_tile_index, win_x, win_y, 0);
-                    shade = pyemu_gameboy_apply_palette(bgp, bg_color_id);
-                }
-            } else if (gb->rom_loaded) {
-                shade = gb->memory[(uint16_t)(0x9800 + ((x / 8) + ((y / 8) * 32)) % 0x0400)];
-            } else {
-                shade = (uint8_t)((x + y + gb->cpu.a + pyemu_gameboy_read_memory(gb, PYEMU_IO_LY)) % 255);
-            }
-
-            if (lcdc & 0x02) {
-                int sprite_height = (lcdc & 0x04) ? 16 : 8;
-                for (sprite_index = 0; sprite_index < 40; ++sprite_index) {
-                    uint16_t oam = (uint16_t)(0xFE00 + sprite_index * 4);
-                    int sprite_y = (int)pyemu_gameboy_read_memory(gb, oam) - 16;
-                    int sprite_x = (int)pyemu_gameboy_read_memory(gb, (uint16_t)(oam + 1)) - 8;
-                    uint8_t tile = pyemu_gameboy_read_memory(gb, (uint16_t)(oam + 2));
-                    uint8_t attrs = pyemu_gameboy_read_memory(gb, (uint16_t)(oam + 3));
-                    uint8_t sprite_color_id;
-                    uint8_t sprite_palette;
-                    uint8_t sx;
-                    uint8_t sy;
-
-                    if (x < sprite_x || x >= sprite_x + 8 || y < sprite_y || y >= sprite_y + sprite_height) {
-                        continue;
-                    }
-
-                    sx = (uint8_t)(x - sprite_x);
-                    sy = (uint8_t)(y - sprite_y);
-                    if (attrs & 0x20) {
-                        sx = (uint8_t)(7 - sx);
-                    }
-                    if (attrs & 0x40) {
-                        sy = (uint8_t)(sprite_height - 1 - sy);
-                    }
-
-                    if (sprite_height == 16) {
-                        tile &= 0xFE;
-                        if (sy >= 8) {
-                            tile = (uint8_t)(tile + 1);
-                            sy = (uint8_t)(sy - 8);
-                        }
-                    }
-
-                    sprite_color_id = pyemu_gameboy_tile_pixel(gb, lcdc, tile, sx, sy, 1);
-                    if (sprite_color_id == 0) {
-                        continue;
-                    }
-                    if ((attrs & 0x80) && bg_color_id != 0) {
-                        continue;
-                    }
-
-                    sprite_palette = (attrs & 0x10) ? obp1 : obp0;
-                    shade = pyemu_gameboy_apply_palette(sprite_palette, sprite_color_id);
-                    break;
-                }
-            }
-
-            gb->frame[pixel + 0] = shade;
-            gb->frame[pixel + 1] = shade;
-            gb->frame[pixel + 2] = shade;
-            gb->frame[pixel + 3] = 255;
-        }
+        pyemu_gameboy_render_scanline(gb, (uint8_t)y);
     }
 }
 
@@ -1362,7 +1381,7 @@ static void pyemu_gameboy_tick(pyemu_gameboy_system* gb, int cycles) {
             uint8_t current_ly = pyemu_gameboy_read_memory(gb, PYEMU_IO_LY);
             uint8_t ly;
             if (current_ly < PYEMU_GAMEBOY_HEIGHT) {
-                pyemu_gameboy_latch_scanline_registers(gb, current_ly);
+                pyemu_gameboy_render_scanline(gb, current_ly);
             }
             gb->ppu_counter -= PYEMU_GAMEBOY_CYCLES_PER_SCANLINE;
             ly = (uint8_t)(current_ly + 1);
@@ -1373,6 +1392,9 @@ static void pyemu_gameboy_tick(pyemu_gameboy_system* gb, int cycles) {
                 ly = 0;
             }
             gb->memory[PYEMU_IO_LY] = ly;
+            if (ly < PYEMU_GAMEBOY_HEIGHT) {
+                pyemu_gameboy_latch_scanline_registers(gb, ly);
+            }
             stat_needs_update = 1;
         }
 
@@ -1542,6 +1564,7 @@ static void pyemu_gameboy_reset(pyemu_system* system) {
     gb->stat_irq_line = 0;
     memset(&gb->last_access, 0, sizeof(gb->last_access));
     memset(&gb->last_mapper_access, 0, sizeof(gb->last_mapper_access));
+    memset(gb->block_cache, 0, sizeof(gb->block_cache));
     gb->bus_tracking_enabled = 1;
     gb->battery_dirty = 0;
 
@@ -1570,6 +1593,7 @@ static void pyemu_gameboy_reset(pyemu_system* system) {
 
     pyemu_gameboy_sync_memory(gb);
     pyemu_gameboy_set_post_boot_state(gb);
+    pyemu_gameboy_latch_scanline_registers(gb, 0);
     pyemu_gameboy_update_demo_frame(gb);
 }
 
@@ -2098,6 +2122,10 @@ static int pyemu_gameboy_execute_opcode(pyemu_gameboy_system* gb, uint8_t opcode
             cycles = 8;
             break;
         }
+        case 0x3B:
+            gb->cpu.sp = (uint16_t)(gb->cpu.sp - 1);
+            cycles = 8;
+            break;
         case 0x36: {
             uint16_t hl = pyemu_gameboy_get_hl(gb);
             pyemu_gameboy_write_memory(gb, hl, pyemu_gameboy_fetch_u8(gb));
@@ -3185,6 +3213,7 @@ static void pyemu_gameboy_fast_forward_to_vblank(pyemu_gameboy_system* gb) {
     if (ly < PYEMU_GAMEBOY_HEIGHT) {
         for (line = ly; line < PYEMU_GAMEBOY_HEIGHT; ++line) {
             pyemu_gameboy_latch_scanline_registers(gb, line);
+            pyemu_gameboy_render_scanline(gb, line);
         }
     }
 
@@ -3224,7 +3253,6 @@ static void pyemu_gameboy_step_frame(pyemu_system* system) {
         }
     }
 
-    pyemu_gameboy_update_demo_frame(gb);
 }
 
 static void pyemu_gameboy_destroy(pyemu_system* system) {

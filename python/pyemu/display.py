@@ -81,6 +81,9 @@ class DisplayBackend:
     def close(self) -> None:
         raise NotImplementedError
 
+    def reset_state(self) -> None:
+        self.close()
+
     def poll_input(self) -> tuple[int, int]:
         return 0x0F, 0x0F
 
@@ -104,6 +107,9 @@ class QtDisplayWindow(QMainWindow, DisplayBackend):
 
     def present(self, frame: FrameBuffer) -> None:
         self._frame_widget.update_frame(frame)
+
+    def reset_state(self) -> None:
+        self._frame_widget.update_frame(FrameBuffer(width=self._frame_widget._system.screen_width, height=self._frame_widget._system.screen_height, rgba=[]))
 
 
 class PygameDisplayBackend(DisplayBackend):
@@ -130,6 +136,8 @@ class PygameDisplayBackend(DisplayBackend):
         self._scale = max(1, scale)
         self._window_size = (system.screen_width * self._scale, system.screen_height * self._scale)
         self._screen = None
+        self._frame_surface = None
+        self._present_surface = None
         self._last_frame = None
         self._buttons = 0x0F
         self._directions = 0x0F
@@ -140,14 +148,46 @@ class PygameDisplayBackend(DisplayBackend):
         if not pygame.display.get_init():
             pygame.display.init()
 
+    def _create_screen(self, size: tuple[int, int] | None = None):
+        window_size = size or self._window_size
+        flags = pygame.RESIZABLE | pygame.DOUBLEBUF
+        if hasattr(pygame, "HWSURFACE"):
+            flags |= pygame.HWSURFACE
+        try:
+            screen = pygame.display.set_mode(window_size, flags, vsync=1)
+        except TypeError:
+            screen = pygame.display.set_mode(window_size, flags)
+        except pygame.error:
+            screen = pygame.display.set_mode(window_size, flags)
+        self._window_size = screen.get_size()
+        self._recreate_surfaces()
+        return screen
+
+    def _recreate_surfaces(self) -> None:
+        self._frame_surface = pygame.Surface((self._system.screen_width, self._system.screen_height), flags=pygame.SRCALPHA, depth=32)
+        if self._screen is not None:
+            self._present_surface = pygame.Surface(self._screen.get_size()).convert()
+        else:
+            self._present_surface = None
+
     def show(self) -> None:
+        if not pygame.display.get_init():
+            pygame.display.init()
         if self._screen is None:
-            self._screen = pygame.display.set_mode(self._window_size, pygame.RESIZABLE)
+            self._screen = self._create_screen()
             pygame.display.set_caption(self._title)
             if self._last_frame is not None:
                 self.present(self._last_frame)
+            else:
+                self._clear_screen()
         else:
             pygame.display.set_caption(self._title)
+
+    def _clear_screen(self) -> None:
+        if self._screen is None:
+            return
+        self._screen.fill((0, 0, 0))
+        pygame.display.flip()
 
     def focus(self) -> None:
         self.show()
@@ -177,18 +217,33 @@ class PygameDisplayBackend(DisplayBackend):
         rgba = bytes(frame.rgba or [])
         expected_size = frame.width * frame.height * 4
         if len(rgba) != expected_size or expected_size == 0:
+            self._clear_screen()
             return
 
-        surface = pygame.image.frombuffer(rgba, (frame.width, frame.height), "RGBA")
-        window_size = self._screen.get_size()
-        scaled = pygame.transform.scale(surface, window_size)
-        self._screen.blit(scaled, (0, 0))
+        if self._frame_surface is None or self._present_surface is None:
+            self._recreate_surfaces()
+        if self._frame_surface is None or self._present_surface is None:
+            return
+
+        source_surface = pygame.image.frombuffer(rgba, (frame.width, frame.height), "RGBA")
+        self._frame_surface.blit(source_surface, (0, 0))
+        pygame.transform.scale(self._frame_surface, self._screen.get_size(), self._present_surface)
+        self._screen.blit(self._present_surface, (0, 0))
         pygame.display.flip()
 
     def close(self) -> None:
         if self._screen is not None:
             pygame.display.quit()
             self._screen = None
+        self._frame_surface = None
+        self._present_surface = None
+
+    def reset_state(self) -> None:
+        self.close()
+        self._last_frame = None
+        self._buttons = 0x0F
+        self._directions = 0x0F
+        self._pending_actions.clear()
 
     def poll_input(self) -> tuple[int, int]:
         if self._screen is None:
@@ -234,8 +289,12 @@ class PygameDisplayBackend(DisplayBackend):
             if event.type == pygame.QUIT:
                 self.close()
             elif event.type == pygame.VIDEORESIZE and self._screen is not None:
-                self._screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+                self._screen = self._create_screen(event.size)
                 pygame.display.set_caption(self._title)
+                if self._last_frame is not None:
+                    self.present(self._last_frame)
+                else:
+                    self._clear_screen()
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_q:
                     self._pending_actions.add("start_trace")

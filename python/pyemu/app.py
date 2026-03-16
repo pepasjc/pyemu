@@ -480,6 +480,12 @@ class EmulatorWindow(QMainWindow):
     def _show_display_window(self) -> None:
         self.display_window.focus()
 
+    def _reset_display_and_input_state(self) -> None:
+        self._manual_buttons = 0x0F
+        self._manual_directions = 0x0F
+        self.display_window.reset_state()
+        self.emulator.set_gameboy_joypad_state(0x0F, 0x0F)
+
     def _make_action(self, action):
         def callback() -> None:
             action()
@@ -499,6 +505,7 @@ class EmulatorWindow(QMainWindow):
 
     def _reset_emulator(self) -> None:
         self.pause_running()
+        self._reset_display_and_input_state()
         self.emulator.reset()
         self._clear_rewind_history()
         self._record_rewind_snapshot(force=True)
@@ -527,6 +534,8 @@ class EmulatorWindow(QMainWindow):
     def start_running(self) -> None:
         if not self.emulator.media.loaded:
             return
+        if self.emulator.run_state == RunState.RUNNING:
+            return
         self._record_rewind_snapshot(force=True)
         buttons, directions = self._current_input_state()
         self._append_trace_entry("run_started", buttons, directions, force_snapshot=True)
@@ -536,6 +545,7 @@ class EmulatorWindow(QMainWindow):
         self._frame_budget = 0.0
         self.emulator.set_bus_tracking(False)
         self.emulator.run()
+        self.refresh()
         self._run_timer.start()
         self._show_display_window()
         self._present_display()
@@ -660,15 +670,17 @@ class EmulatorWindow(QMainWindow):
             Path.cwd() / "TETRIS.ZIP",
         ])
         for candidate in candidates:
-            if candidate.exists() and self.emulator.load_media(str(candidate)):
-                self._save_last_media_path(str(candidate))
-                self._clear_rewind_history()
-                self._record_rewind_snapshot(force=True)
-                self._trace_frame_counter = 0
-                self.refresh()
-                self._show_display_window()
-                self.start_running()
-                break
+            if candidate.exists():
+                self._reset_display_and_input_state()
+                if self.emulator.load_media(str(candidate)):
+                    self._save_last_media_path(str(candidate))
+                    self._clear_rewind_history()
+                    self._record_rewind_snapshot(force=True)
+                    self._trace_frame_counter = 0
+                    self.refresh()
+                    self._show_display_window()
+                    self.start_running()
+                    break
 
     def load_media(self) -> None:
         self.pause_running()
@@ -680,6 +692,7 @@ class EmulatorWindow(QMainWindow):
         )
         if not path:
             return
+        self._reset_display_and_input_state()
         try:
             loaded = self.emulator.load_media(path)
         except ValueError as exc:
@@ -774,6 +787,7 @@ class EmulatorWindow(QMainWindow):
             status_lines = [
                 f"System: {self.emulator.system.display_name}",
                 f"Native backend: {'yes' if self.emulator.native_available else 'no'}",
+                f"Native DLL: {Path(self.emulator.native_library_path).name if self.emulator.native_library_path else 'fallback'}",
                 f"Run state: {self.emulator.run_state.name}",
                 f"Target FPS: {self.emulator.system.frame_rate:.3f}",
                 f"Display: {self.display_window.info.label}",
