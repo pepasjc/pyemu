@@ -43,6 +43,35 @@ Start here if you want to understand or extend the emulator:
 3. Run the debugger:
    - `uv run python -m pyemu`
 
+## Testing
+
+There are two lightweight regression layers today.
+
+### Public test ROMs
+
+We use a curated subset of the public [game-boy-test-roms](https://github.com/c-sp/game-boy-test-roms/releases) pack for repo-safe regression checks.
+
+Download the pack into `artifacts/` automatically and run the curated suite:
+
+```powershell
+uv run python scripts/public_test_roms.py --download
+```
+
+If you already have an unpacked copy somewhere else, point the runner at it:
+
+```powershell
+$env:PYEMU_PUBLIC_TEST_ROMS_DIR='E:\path\to\game-boy-test-roms'
+uv run python scripts/public_test_roms.py
+```
+
+### Local gameplay smoke tests
+
+For personal/local regression checks against commercial ROMs already present on your machine:
+
+```powershell
+uv run python scripts/regression_smoke.py
+```
+
 ## Native build notes
 
 The Python runtime loads the newest known-good native DLL from `build/native/` on Windows.
