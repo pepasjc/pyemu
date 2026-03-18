@@ -867,6 +867,15 @@ def _library_candidates() -> list[Path]:
     workspace_root = package_root.parent.parent
     if sys.platform.startswith("win"):
         return [
+            workspace_root / "build" / "native" / "pyemu_native_timed130.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed129.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed128.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed127.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed126.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed125.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed124.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed123.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed122.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed121.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed120.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed119.dll",

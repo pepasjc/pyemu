@@ -1,6 +1,13 @@
 add_library(pyemu_native SHARED
     src/core/emulator.c
     src/systems/gameboy/gameboy_system.c
+    src/systems/gameboy/apu.c
+    src/systems/gameboy/mapper.c
+    src/systems/gameboy/ppu.c
+    src/systems/gameboy/input.c
+    src/systems/gameboy/cpu_helpers.c
+    src/systems/gameboy/cpu_core.c
+    src/systems/gameboy/cpu_exec.c
 )
 
 target_include_directories(pyemu_native

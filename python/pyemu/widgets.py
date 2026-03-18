@@ -76,11 +76,11 @@ class FrameBufferWidget(QWidget):
         mapped = bytearray(rgba)
         for index in range(0, len(mapped), 4):
             shade = mapped[index]
-            if shade >= 224:
+            if shade >= 213:
                 palette_index = 0
-            elif shade >= 160:
+            elif shade >= 128:
                 palette_index = 1
-            elif shade >= 96:
+            elif shade >= 43:
                 palette_index = 2
             else:
                 palette_index = 3
