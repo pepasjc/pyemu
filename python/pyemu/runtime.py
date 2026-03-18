@@ -60,6 +60,54 @@ class CartridgeDebugInfo:
 
 
 @dataclass
+class AudioBuffer:
+    sample_rate: int = 48000
+    channels: int = 2
+    pcm16le: bytes = b""
+
+
+@dataclass
+class GameBoyAudioDebugInfo:
+    nr10: int = 0
+    nr11: int = 0
+    nr12: int = 0
+    nr13: int = 0
+    nr14: int = 0
+    nr21: int = 0
+    nr22: int = 0
+    nr23: int = 0
+    nr24: int = 0
+    nr30: int = 0
+    nr32: int = 0
+    nr33: int = 0
+    nr34: int = 0
+    nr41: int = 0
+    nr42: int = 0
+    nr43: int = 0
+    nr44: int = 0
+    nr50: int = 0
+    nr51: int = 0
+    nr52: int = 0
+    ch1_enabled: bool = False
+    ch1_duty: int = 0
+    ch1_volume: int = 0
+    ch1_frequency_raw: int = 0
+    ch2_enabled: bool = False
+    ch2_duty: int = 0
+    ch2_volume: int = 0
+    ch2_frequency_raw: int = 0
+    ch3_enabled: bool = False
+    ch3_volume_code: int = 0
+    ch3_frequency_raw: int = 0
+    ch4_enabled: bool = False
+    ch4_volume: int = 0
+    ch4_width_mode: int = 0
+    ch4_divisor_code: int = 0
+    ch4_clock_shift: int = 0
+    ch4_lfsr: int = 0
+
+
+@dataclass
 class FrameBuffer:
     width: int = 160
     height: int = 144
@@ -68,6 +116,51 @@ class FrameBuffer:
     def __post_init__(self) -> None:
         if self.rgba is None:
             self.rgba = [0] * (self.width * self.height * 4)
+
+
+@dataclass(frozen=True)
+class InputActionInfo:
+    key: str
+    label: str
+    group: str
+    bitmask: int
+    ui_row: int
+    ui_col: int
+
+
+@dataclass(frozen=True)
+class DebugMemoryRegionInfo:
+    key: str
+    label: str
+    start: int
+    end: int
+    writable: bool = True
+
+
+@dataclass(frozen=True)
+class DebugWatchInfo:
+    key: str
+    label: str
+    source: str
+    address: int | None = None
+    address2: int | None = None
+
+
+@dataclass(frozen=True)
+class DebugRegisterInfo:
+    key: str
+    label: str
+    source: str
+    attr: str | None = None
+    hi_attr: str | None = None
+    lo_attr: str | None = None
+
+
+@dataclass(frozen=True)
+class DebugFlagInfo:
+    key: str
+    label: str
+    mask: int
 
 
 @dataclass(frozen=True)
@@ -80,11 +173,26 @@ class SystemInfo:
     frame_rate: float
     media_label: str
     media_extensions: tuple[str, ...]
+    input_actions: tuple[InputActionInfo, ...]
+    default_key_bindings: dict[str, str]
+    default_joystick_bindings: dict[str, str]
+    debug_memory_regions: tuple[DebugMemoryRegionInfo, ...]
+    debug_watch_entries: tuple[DebugWatchInfo, ...]
+    debug_registers: tuple[DebugRegisterInfo, ...]
+    debug_flags: tuple[DebugFlagInfo, ...]
 
     @property
     def file_dialog_filter(self) -> str:
         patterns = " ".join(f"*.{extension}" for extension in self.media_extensions)
         return f"{self.media_label} ({patterns});;All files (*.*)"
+
+    @property
+    def input_action_map(self) -> dict[str, InputActionInfo]:
+        return {action.key: action for action in self.input_actions}
+
+    @property
+    def debug_memory_region_map(self) -> dict[str, DebugMemoryRegionInfo]:
+        return {region.label: region for region in self.debug_memory_regions}
 
 
 @dataclass
@@ -105,6 +213,68 @@ SUPPORTED_SYSTEMS: dict[str, SystemInfo] = {
         frame_rate=59.7275,
         media_label="Game Boy ROM",
         media_extensions=("gb", "gbc", "zip"),
+        input_actions=(
+            InputActionInfo("up", "Up", "directions", 0x04, 0, 1),
+            InputActionInfo("left", "Left", "directions", 0x02, 1, 0),
+            InputActionInfo("down", "Down", "directions", 0x08, 1, 1),
+            InputActionInfo("right", "Right", "directions", 0x01, 1, 2),
+            InputActionInfo("a", "A", "buttons", 0x01, 0, 3),
+            InputActionInfo("b", "B", "buttons", 0x02, 0, 4),
+            InputActionInfo("select", "Select", "buttons", 0x04, 1, 3),
+            InputActionInfo("start", "Start", "buttons", 0x08, 1, 4),
+        ),
+        default_key_bindings={
+            "a": "Z",
+            "b": "X",
+            "select": "Backspace",
+            "start": "Return",
+            "up": "Up",
+            "down": "Down",
+            "left": "Left",
+            "right": "Right",
+        },
+        default_joystick_bindings={
+            "a": "button:0",
+            "b": "button:1",
+            "select": "button:6",
+            "start": "button:7",
+            "up": "hat0:up|axis1:-",
+            "down": "hat0:down|axis1:+",
+            "left": "hat0:left|axis0:-",
+            "right": "hat0:right|axis0:+",
+        },
+        debug_memory_regions=(
+            DebugMemoryRegionInfo("vram", "VRAM", 0x8000, 0xA000, True),
+            DebugMemoryRegionInfo("ram", "RAM", 0xC000, 0xE000, True),
+            DebugMemoryRegionInfo("hram", "HRAM", 0xFF80, 0x10000, True),
+            DebugMemoryRegionInfo("io", "IO", 0xFF00, 0xFF80, True),
+        ),
+        debug_watch_entries=(
+            DebugWatchInfo("last_opcode", "last opcode", "memory8", 0xC000),
+            DebugWatchInfo("entrypoint", "entrypoint", "memory8", 0x0100),
+            DebugWatchInfo("joypad", "joypad FF00", "memory8", 0xFF00),
+            DebugWatchInfo("buttons", "buttons", "input_buttons"),
+            DebugWatchInfo("directions", "directions", "input_directions"),
+            DebugWatchInfo("ie_if", "IE/IF", "memory8_pair", 0xFFFF, 0xFF0F),
+            DebugWatchInfo("ff82", "FF82 handshake", "memory8", 0xFF82),
+            DebugWatchInfo("ff97", "FF97 counter", "memory8", 0xFF97),
+            DebugWatchInfo("ff9b", "FF9B state", "memory8", 0xFF9B),
+            DebugWatchInfo("a298", "A298 save byte", "memory8", 0xA298),
+        ),
+        debug_registers=(
+            DebugRegisterInfo("pc", "PC", "u16_attr", attr="pc"),
+            DebugRegisterInfo("sp", "SP", "u16_attr", attr="sp"),
+            DebugRegisterInfo("af", "AF", "u8_pair", hi_attr="a", lo_attr="f"),
+            DebugRegisterInfo("bc", "BC", "u8_pair", hi_attr="b", lo_attr="c"),
+            DebugRegisterInfo("de", "DE", "u8_pair", hi_attr="d", lo_attr="e"),
+            DebugRegisterInfo("hl", "HL", "u8_pair", hi_attr="h", lo_attr="l"),
+        ),
+        debug_flags=(
+            DebugFlagInfo("z", "Z", 0x80),
+            DebugFlagInfo("n", "N", 0x40),
+            DebugFlagInfo("h", "H", 0x20),
+            DebugFlagInfo("c", "C", 0x10),
+        ),
     )
 }
 
@@ -145,6 +315,21 @@ class Emulator:
     @property
     def frame_buffer(self) -> FrameBuffer:
         return self._backend.frame_buffer
+
+    @property
+    def audio_buffer(self) -> AudioBuffer:
+        return self._backend.audio_buffer
+
+    def gameboy_audio_channel_buffer(self, channel: int) -> AudioBuffer:
+        if hasattr(self._backend, "gameboy_audio_channel_buffer"):
+            return self._backend.gameboy_audio_channel_buffer(channel)
+        return AudioBuffer()
+
+    @property
+    def gameboy_audio_debug(self) -> GameBoyAudioDebugInfo:
+        if hasattr(self._backend, "gameboy_audio_debug"):
+            return self._backend.gameboy_audio_debug
+        return GameBoyAudioDebugInfo()
 
     @property
     def media(self) -> MediaInfo:
@@ -203,6 +388,10 @@ class Emulator:
     def memory_snapshot(self) -> list[int]:
         return self._backend.memory_snapshot()
 
+    def poke_memory(self, address: int, value: int) -> None:
+        if hasattr(self._backend, "poke_memory"):
+            self._backend.poke_memory(address, value)
+
     def set_gameboy_joypad_state(self, buttons: int, directions: int) -> None:
         if hasattr(self._backend, "set_gameboy_joypad_state"):
             self._backend.set_gameboy_joypad_state(buttons, directions)
@@ -210,28 +399,6 @@ class Emulator:
     def set_bus_tracking(self, enabled: bool) -> None:
         if hasattr(self._backend, "set_bus_tracking"):
             self._backend.set_bus_tracking(enabled)
-
-    @property
-    def cartridge_debug(self) -> CartridgeDebugInfo:
-        if hasattr(self._lib, "pyemu_get_cartridge_debug_info"):
-            info = self._lib.pyemu_get_cartridge_debug_info(self._handle)
-            return CartridgeDebugInfo(
-                cartridge_type=int(info.cartridge_type),
-                rom_size_code=int(info.rom_size_code),
-                ram_size_code=int(info.ram_size_code),
-                ram_enabled=bool(info.ram_enabled),
-                rom_bank=int(info.rom_bank),
-                ram_bank=int(info.ram_bank),
-                banking_mode=int(info.banking_mode),
-                has_battery=bool(info.has_battery),
-                save_file_present=bool(info.save_file_present),
-                last_mapper_value=int(info.last_mapper_value),
-                last_mapper_valid=bool(info.last_mapper_valid),
-                last_mapper_address=int(info.last_mapper_address),
-                rom_bank_count=int(info.rom_bank_count),
-                ram_bank_count=int(info.ram_bank_count),
-            )
-        return CartridgeDebugInfo()
 
     @property
     def last_bus_access(self) -> LastBusAccess:
@@ -307,6 +474,7 @@ class _NativeEmulator:
             h=int(state.h),
             l=int(state.l),
             halted=bool(state.halted),
+            ime=bool(state.ime),
         )
 
     @property
@@ -316,6 +484,43 @@ class _NativeEmulator:
         if frame.rgba != self._ffi.NULL and int(frame.rgba_size) > 0:
             rgba = list(bytes(self._ffi.buffer(frame.rgba, int(frame.rgba_size))))
         return FrameBuffer(width=int(frame.width), height=int(frame.height), rgba=rgba)
+
+    @property
+    def audio_buffer(self) -> AudioBuffer:
+        audio = self._lib.pyemu_get_audio_buffer(self._handle)
+        pcm = b""
+        if audio.samples != self._ffi.NULL and int(audio.sample_count) > 0:
+            pcm = bytes(self._ffi.buffer(audio.samples, int(audio.sample_count) * 2))
+        return AudioBuffer(sample_rate=int(audio.sample_rate), channels=int(audio.channels), pcm16le=pcm)
+
+    def gameboy_audio_channel_buffer(self, channel: int) -> AudioBuffer:
+        if not hasattr(self._lib, "pyemu_get_gameboy_audio_channel_buffer"):
+            return AudioBuffer()
+        audio = self._lib.pyemu_get_gameboy_audio_channel_buffer(self._handle, int(channel))
+        pcm = b""
+        if audio.samples != self._ffi.NULL and int(audio.sample_count) > 0:
+            pcm = bytes(self._ffi.buffer(audio.samples, int(audio.sample_count) * 2))
+        return AudioBuffer(sample_rate=int(audio.sample_rate), channels=int(audio.channels), pcm16le=pcm)
+
+    @property
+    def gameboy_audio_debug(self) -> GameBoyAudioDebugInfo:
+        if not hasattr(self._lib, "pyemu_get_gameboy_audio_debug_info"):
+            return GameBoyAudioDebugInfo()
+        info = self._ffi.new("pyemu_gameboy_audio_debug_info *")
+        if not self._lib.pyemu_get_gameboy_audio_debug_info(self._handle, info):
+            return GameBoyAudioDebugInfo()
+        value = info[0]
+        return GameBoyAudioDebugInfo(
+            nr10=int(value.nr10), nr11=int(value.nr11), nr12=int(value.nr12), nr13=int(value.nr13), nr14=int(value.nr14),
+            nr21=int(value.nr21), nr22=int(value.nr22), nr23=int(value.nr23), nr24=int(value.nr24),
+            nr30=int(value.nr30), nr32=int(value.nr32), nr33=int(value.nr33), nr34=int(value.nr34),
+            nr41=int(value.nr41), nr42=int(value.nr42), nr43=int(value.nr43), nr44=int(value.nr44),
+            nr50=int(value.nr50), nr51=int(value.nr51), nr52=int(value.nr52),
+            ch1_enabled=bool(value.ch1_enabled), ch1_duty=int(value.ch1_duty), ch1_volume=int(value.ch1_volume), ch1_frequency_raw=int(value.ch1_frequency_raw),
+            ch2_enabled=bool(value.ch2_enabled), ch2_duty=int(value.ch2_duty), ch2_volume=int(value.ch2_volume), ch2_frequency_raw=int(value.ch2_frequency_raw),
+            ch3_enabled=bool(value.ch3_enabled), ch3_volume_code=int(value.ch3_volume_code), ch3_frequency_raw=int(value.ch3_frequency_raw),
+            ch4_enabled=bool(value.ch4_enabled), ch4_volume=int(value.ch4_volume), ch4_width_mode=int(value.ch4_width_mode), ch4_divisor_code=int(value.ch4_divisor_code), ch4_clock_shift=int(value.ch4_clock_shift), ch4_lfsr=int(value.ch4_lfsr),
+        )
 
     @property
     def media(self) -> MediaInfo:
@@ -380,6 +585,10 @@ class _NativeEmulator:
             return []
         return list(bytes(self._ffi.buffer(memory, size)))
 
+    def poke_memory(self, address: int, value: int) -> None:
+        if hasattr(self._lib, "pyemu_poke_memory"):
+            self._lib.pyemu_poke_memory(self._handle, int(address) & 0xFFFF, int(value) & 0xFF)
+
     def set_gameboy_joypad_state(self, buttons: int, directions: int) -> None:
         if hasattr(self._lib, "pyemu_set_gameboy_joypad_state"):
             self._lib.pyemu_set_gameboy_joypad_state(self._handle, int(buttons) & 0x0F, int(directions) & 0x0F)
@@ -387,28 +596,6 @@ class _NativeEmulator:
     def set_bus_tracking(self, enabled: bool) -> None:
         if hasattr(self._lib, "pyemu_set_bus_tracking"):
             self._lib.pyemu_set_bus_tracking(self._handle, 1 if enabled else 0)
-
-    @property
-    def cartridge_debug(self) -> CartridgeDebugInfo:
-        if hasattr(self._lib, "pyemu_get_cartridge_debug_info"):
-            info = self._lib.pyemu_get_cartridge_debug_info(self._handle)
-            return CartridgeDebugInfo(
-                cartridge_type=int(info.cartridge_type),
-                rom_size_code=int(info.rom_size_code),
-                ram_size_code=int(info.ram_size_code),
-                ram_enabled=bool(info.ram_enabled),
-                rom_bank=int(info.rom_bank),
-                ram_bank=int(info.ram_bank),
-                banking_mode=int(info.banking_mode),
-                has_battery=bool(info.has_battery),
-                save_file_present=bool(info.save_file_present),
-                last_mapper_value=int(info.last_mapper_value),
-                last_mapper_valid=bool(info.last_mapper_valid),
-                last_mapper_address=int(info.last_mapper_address),
-                rom_bank_count=int(info.rom_bank_count),
-                ram_bank_count=int(info.ram_bank_count),
-            )
-        return CartridgeDebugInfo()
 
     @property
     def last_bus_access(self) -> LastBusAccess:
@@ -439,6 +626,9 @@ class _FallbackEmulator:
         self.run_state = RunState.STOPPED
         self.cpu_state = CPUState(pc=0x0100, sp=0xFFFE)
         self.frame_buffer = FrameBuffer(width=system.screen_width, height=system.screen_height)
+        self.audio_buffer = AudioBuffer()
+        self.gameboy_audio_debug = GameBoyAudioDebugInfo()
+        self.gameboy_audio_debug = GameBoyAudioDebugInfo()
         self.media = MediaInfo()
         self._memory = [0] * 0x10000
         self.cycle_count = 0
@@ -448,6 +638,7 @@ class _FallbackEmulator:
         self.run_state = RunState.PAUSED
         self.cpu_state = CPUState(pc=0x0100, sp=0xFFFE)
         self.frame_buffer = FrameBuffer(width=self._system.screen_width, height=self._system.screen_height)
+        self.audio_buffer = AudioBuffer()
         self._memory = [0] * 0x10000
         self.cycle_count = 0
         self.faulted = False
@@ -499,34 +690,16 @@ class _FallbackEmulator:
     def memory_snapshot(self) -> list[int]:
         return list(self._memory)
 
+    def poke_memory(self, address: int, value: int) -> None:
+        if 0 <= int(address) < len(self._memory):
+            self._memory[int(address)] = int(value) & 0xFF
+
     def set_gameboy_joypad_state(self, buttons: int, directions: int) -> None:
         self._memory[0xFF80] = buttons & 0x0F
         self._memory[0xFF81] = directions & 0x0F
 
     def set_bus_tracking(self, enabled: bool) -> None:
         return
-
-    @property
-    def cartridge_debug(self) -> CartridgeDebugInfo:
-        if hasattr(self._lib, "pyemu_get_cartridge_debug_info"):
-            info = self._lib.pyemu_get_cartridge_debug_info(self._handle)
-            return CartridgeDebugInfo(
-                cartridge_type=int(info.cartridge_type),
-                rom_size_code=int(info.rom_size_code),
-                ram_size_code=int(info.ram_size_code),
-                ram_enabled=bool(info.ram_enabled),
-                rom_bank=int(info.rom_bank),
-                ram_bank=int(info.ram_bank),
-                banking_mode=int(info.banking_mode),
-                has_battery=bool(info.has_battery),
-                save_file_present=bool(info.save_file_present),
-                last_mapper_value=int(info.last_mapper_value),
-                last_mapper_valid=bool(info.last_mapper_valid),
-                last_mapper_address=int(info.last_mapper_address),
-                rom_bank_count=int(info.rom_bank_count),
-                ram_bank_count=int(info.ram_bank_count),
-            )
-        return CartridgeDebugInfo()
 
     @property
     def last_bus_access(self) -> LastBusAccess:
@@ -571,6 +744,53 @@ def _load_native_library() -> tuple[FFI, object, Path] | None:
             const uint8_t* rgba;
             size_t rgba_size;
         } pyemu_frame_buffer;
+
+        typedef struct pyemu_audio_buffer {
+            int sample_rate;
+            int channels;
+            const int16_t* samples;
+            size_t sample_count;
+        } pyemu_audio_buffer;
+
+        typedef struct pyemu_gameboy_audio_debug_info {
+            uint8_t nr10;
+            uint8_t nr11;
+            uint8_t nr12;
+            uint8_t nr13;
+            uint8_t nr14;
+            uint8_t nr21;
+            uint8_t nr22;
+            uint8_t nr23;
+            uint8_t nr24;
+            uint8_t nr30;
+            uint8_t nr32;
+            uint8_t nr33;
+            uint8_t nr34;
+            uint8_t nr41;
+            uint8_t nr42;
+            uint8_t nr43;
+            uint8_t nr44;
+            uint8_t nr50;
+            uint8_t nr51;
+            uint8_t nr52;
+            uint8_t ch1_enabled;
+            uint8_t ch1_duty;
+            uint8_t ch1_volume;
+            uint8_t ch2_enabled;
+            uint8_t ch2_duty;
+            uint8_t ch2_volume;
+            uint8_t ch3_enabled;
+            uint8_t ch3_volume_code;
+            uint8_t ch4_enabled;
+            uint8_t ch4_volume;
+            uint8_t ch4_width_mode;
+            uint8_t ch4_divisor_code;
+            uint8_t ch4_clock_shift;
+            uint16_t ch1_frequency_raw;
+            uint16_t ch2_frequency_raw;
+            uint16_t ch3_frequency_raw;
+            uint16_t ch4_lfsr;
+        } pyemu_gameboy_audio_debug_info;
 
         typedef struct pyemu_last_bus_access {
             uint16_t address;
@@ -618,7 +838,9 @@ def _load_native_library() -> tuple[FFI, object, Path] | None:
         const char* pyemu_get_system_name(const pyemu_emulator* emulator);
         pyemu_cpu_state pyemu_get_cpu_state(const pyemu_emulator* emulator);
         pyemu_frame_buffer pyemu_get_frame_buffer(const pyemu_emulator* emulator);
+        pyemu_audio_buffer pyemu_get_audio_buffer(const pyemu_emulator* emulator);
         const uint8_t* pyemu_get_memory(const pyemu_emulator* emulator, size_t* size);
+        void pyemu_poke_memory(pyemu_emulator* emulator, uint16_t address, uint8_t value);
         int pyemu_has_rom_loaded(const pyemu_emulator* emulator);
         const char* pyemu_get_rom_path(const pyemu_emulator* emulator);
         const char* pyemu_get_cartridge_title(const pyemu_emulator* emulator);
@@ -627,6 +849,8 @@ def _load_native_library() -> tuple[FFI, object, Path] | None:
         pyemu_last_bus_access pyemu_get_last_bus_access(const pyemu_emulator* emulator);
         pyemu_cartridge_debug_info pyemu_get_cartridge_debug_info(const pyemu_emulator* emulator);
         int pyemu_is_faulted(const pyemu_emulator* emulator);
+        pyemu_audio_buffer pyemu_get_gameboy_audio_channel_buffer(const pyemu_emulator* emulator, int channel);
+        int pyemu_get_gameboy_audio_debug_info(const pyemu_emulator* emulator, pyemu_gameboy_audio_debug_info* out_info);
         void pyemu_set_gameboy_joypad_state(pyemu_emulator* emulator, uint8_t buttons, uint8_t directions);
         void pyemu_set_bus_tracking(pyemu_emulator* emulator, int enabled);
         """
@@ -643,6 +867,19 @@ def _library_candidates() -> list[Path]:
     workspace_root = package_root.parent.parent
     if sys.platform.startswith("win"):
         return [
+            workspace_root / "build" / "native" / "pyemu_native_timed121.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed120.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed119.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed118.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed117.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed116.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed115.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed114.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed113.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed112.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed111.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed110.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed109.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed108.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed107.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed106.dll",

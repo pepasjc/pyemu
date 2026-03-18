@@ -1,9 +1,11 @@
-from .runtime import CPUState, Emulator, FrameBuffer, MediaInfo, RunState, SUPPORTED_SYSTEMS, SystemInfo
+from .runtime import AudioBuffer, CPUState, Emulator, FrameBuffer, GameBoyAudioDebugInfo, MediaInfo, RunState, SUPPORTED_SYSTEMS, SystemInfo
 
 __all__ = [
+    "AudioBuffer",
     "CPUState",
     "Emulator",
     "FrameBuffer",
+    "GameBoyAudioDebugInfo",
     "MediaInfo",
     "RunState",
     "SUPPORTED_SYSTEMS",

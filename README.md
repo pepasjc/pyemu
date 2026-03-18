@@ -1,44 +1,62 @@
 # pyemu
 
-`pyemu` is an educational emulator project with a native core in C and a
-Python-first interface for inspection, scripting, and debugging.
+`pyemu` is an educational emulator project with a native core in C and a Python-first debugger/UI.
 
-The first target system is the Nintendo Game Boy. The codebase is organized so
-we can add more systems later while keeping a stable Python API.
+The current system is the Nintendo Game Boy, but the project is structured as a multi-core framework:
+- a stable native emulator handle in C
+- per-system implementations behind a `pyemu_system_vtable`
+- a Python runtime layer via `cffi`
+- a desktop debugger built with `PySide6` and a pluggable display backend
 
-## Goals
+## Current capabilities
 
-- Keep emulation logic explicit and easy to study
-- Expose CPU, memory, and frame state to Python
-- Support stepping, tracing, and future debugger features
-- Leave room for scripting and autopilot experiments
+- run, pause, step instruction, step frame
+- save/load state and rewind
+- trace capture for debugging tricky game paths
+- battery-backed save RAM persistence
+- zipped ROM loading
+- live debugger panels for CPU, memory, cartridge state, and hardware access
 
-## Layout
+## Project layout
 
-- `native/`: C emulator core and exported API
-- `python/pyemu/`: cffi bridge and PySide6 UI entry point
+- `native/`
+  - C core framework and system implementations
+- `python/pyemu/`
+  - `cffi` runtime, debugger UI, and display backends
+- `docs/`
+  - architecture and contributor notes
+- `roms/`, `states/`, `traces/`
+  - local testing assets and debugging artifacts
 
-## Initial direction
+## Architecture
 
-This scaffold provides:
-
-- a reusable emulator handle and system API
-- a stub Game Boy backend
-- a C ABI consumed from Python through `cffi`
-- a small PySide6 UI shell
+Start here if you want to understand or extend the emulator:
+- [Architecture](E:/projects/pyemu/docs/architecture.md)
+- [Adding a Core](E:/projects/pyemu/docs/adding-a-core.md)
 
 ## Setup with uv
 
 1. Create the virtual environment:
    - `uv venv`
-2. Sync project dependencies:
+2. Sync dependencies:
    - `uv sync`
-3. Build the native library with CMake once a C toolchain is available.
-4. Run the UI:
+3. Run the debugger:
    - `uv run python -m pyemu`
 
-## Notes
+## Native build notes
 
-- `uv sync` will install `cffi` and `PySide6` from `pyproject.toml`.
-- The Python UI works now, but the native C library still needs a working local
-  C toolchain before the `cffi` bridge can load the real backend.
+The Python runtime loads the newest known-good native DLL from `build/native/` on Windows.
+
+A direct local build command we use frequently is:
+
+```powershell
+gcc -shared -O2 -std=c11 -Wall -Wextra -DPYEMU_BUILD_DLL -I native\include native\src\core\emulator.c native\src\systems\gameboy\gameboy_system.c -o build
+ative\pyemu_native_timed110.dll
+```
+
+## Design goals
+
+- keep the core easy to step through and study
+- expose emulator state cleanly to Python
+- make debugging and experimentation first-class
+- keep the system boundary generic so new cores can be added without rewriting the UI

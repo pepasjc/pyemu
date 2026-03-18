@@ -81,6 +81,15 @@ static pyemu_frame_buffer pyemu_zero_frame_buffer(void) {
     return frame;
 }
 
+static pyemu_audio_buffer pyemu_zero_audio_buffer(void) {
+    pyemu_audio_buffer audio;
+    audio.sample_rate = 0;
+    audio.channels = 0;
+    audio.samples = NULL;
+    audio.sample_count = 0;
+    return audio;
+}
+
 PYEMU_API size_t pyemu_get_supported_system_count(void) {
     return PYEMU_SYSTEM_COUNT;
 }
@@ -234,6 +243,15 @@ PYEMU_API pyemu_frame_buffer pyemu_get_frame_buffer(const pyemu_emulator* emulat
     return frame;
 }
 
+PYEMU_API pyemu_audio_buffer pyemu_get_audio_buffer(const pyemu_emulator* emulator) {
+    pyemu_audio_buffer audio = pyemu_zero_audio_buffer();
+    if (emulator == NULL || emulator->system == NULL || emulator->system->vtable->get_audio_buffer == NULL) {
+        return audio;
+    }
+    emulator->system->vtable->get_audio_buffer(emulator->system, &audio);
+    return audio;
+}
+
 PYEMU_API const uint8_t* pyemu_get_memory(const pyemu_emulator* emulator, size_t* size) {
     if (size != NULL) {
         *size = 0;
@@ -242,6 +260,13 @@ PYEMU_API const uint8_t* pyemu_get_memory(const pyemu_emulator* emulator, size_t
         return NULL;
     }
     return emulator->system->vtable->get_memory(emulator->system, size);
+}
+
+PYEMU_API void pyemu_poke_memory(pyemu_emulator* emulator, uint16_t address, uint8_t value) {
+    if (emulator == NULL || emulator->system == NULL || emulator->system->vtable->poke_memory == NULL) {
+        return;
+    }
+    emulator->system->vtable->poke_memory(emulator->system, address, value);
 }
 
 PYEMU_API int pyemu_has_rom_loaded(const pyemu_emulator* emulator) {
@@ -277,6 +302,31 @@ PYEMU_API uint64_t pyemu_get_cycle_count(const pyemu_emulator* emulator) {
         return 0;
     }
     return emulator->system->vtable->get_cycle_count(emulator->system);
+}
+
+PYEMU_API pyemu_audio_buffer pyemu_get_gameboy_audio_channel_buffer(const pyemu_emulator* emulator, int channel) {
+    if (emulator == NULL || emulator->system == NULL) {
+        return pyemu_zero_audio_buffer();
+    }
+    if (strcmp(emulator->system->vtable->name(emulator->system), "gameboy") != 0) {
+        return pyemu_zero_audio_buffer();
+    }
+    return pyemu_gameboy_get_audio_channel_buffer(emulator->system, channel);
+}
+
+PYEMU_API int pyemu_get_gameboy_audio_debug_info(const pyemu_emulator* emulator, pyemu_gameboy_audio_debug_info* out_info) {
+    if (out_info == NULL) {
+        return 0;
+    }
+    memset(out_info, 0, sizeof(*out_info));
+    if (emulator == NULL || emulator->system == NULL) {
+        return 0;
+    }
+    if (strcmp(emulator->system->vtable->name(emulator->system), "gameboy") != 0) {
+        return 0;
+    }
+    pyemu_gameboy_get_audio_debug_info(emulator->system, out_info);
+    return 1;
 }
 
 PYEMU_API void pyemu_set_gameboy_joypad_state(pyemu_emulator* emulator, uint8_t buttons, uint8_t directions) {

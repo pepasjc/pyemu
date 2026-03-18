@@ -7,6 +7,12 @@
 
 typedef struct pyemu_system pyemu_system;
 
+/*
+ * Per-system contract used by the generic emulator handle.
+ *
+ * A new core becomes available to the rest of the project by implementing this
+ * vtable and registering a create function in native/src/core/emulator.c.
+ */
 typedef struct pyemu_system_vtable {
     const char* (*name)(const pyemu_system* system);
     void (*reset)(pyemu_system* system);
@@ -18,7 +24,9 @@ typedef struct pyemu_system_vtable {
     void (*destroy)(pyemu_system* system);
     void (*get_cpu_state)(const pyemu_system* system, pyemu_cpu_state* out_state);
     void (*get_frame_buffer)(const pyemu_system* system, pyemu_frame_buffer* out_frame);
+    void (*get_audio_buffer)(const pyemu_system* system, pyemu_audio_buffer* out_audio);
     const uint8_t* (*get_memory)(const pyemu_system* system, size_t* size);
+    void (*poke_memory)(pyemu_system* system, uint16_t address, uint8_t value);
     int (*has_rom_loaded)(const pyemu_system* system);
     const char* (*get_rom_path)(const pyemu_system* system);
     const char* (*get_cartridge_title)(const pyemu_system* system);
