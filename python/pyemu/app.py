@@ -42,8 +42,37 @@ from PySide6.QtWidgets import (
 
 from .controller_script import ControllerScriptHost, ScriptInput
 from .input_devices import JoystickManager
-from .runtime import AudioBuffer, Emulator, RunState
-from .widgets import FrameBufferWidget, PALETTE_PRESETS
+from .runtime import AudioBuffer, Emulator, RunState, SUPPORTED_SYSTEMS, compatible_system_keys_for_media
+from .widgets import FrameBufferWidget, COLOR_MODE_PRESETS
+
+
+def _session_file_path() -> Path:
+    return Path.cwd() / ".pyemu-session.json"
+
+
+def _load_global_session() -> dict:
+    session_path = _session_file_path()
+    if not session_path.exists():
+        return {}
+    try:
+        data = json.loads(session_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _preferred_system_key_from_session() -> str:
+    saved = _load_global_session().get("last_system_key")
+    if isinstance(saved, str) and saved in SUPPORTED_SYSTEMS:
+        return saved
+    return "gameboy"
+
+
+def _preferred_gb_rom_core_from_session() -> str:
+    saved = _load_global_session().get("preferred_gb_rom_core")
+    if isinstance(saved, str) and saved in {"gameboy", "gbc"}:
+        return saved
+    return "gameboy"
 
 
 class AudioBufferDevice(QIODevice):
@@ -233,8 +262,11 @@ class ControlsDialog(QDialog):
 
 
 class EmulatorWindow(QMainWindow):
-    def __init__(self, system: str = "gameboy") -> None:
+    def __init__(self, system: str = "gameboy", initial_media_path: str | None = None, autoload: bool = True) -> None:
         super().__init__()
+        self._initial_media_path = initial_media_path
+        self._autoload_enabled = autoload
+        self._replacement_window: EmulatorWindow | None = None
         self.emulator = Emulator(system=system)
         self.setWindowTitle(f"pyemu | {self.emulator.system.display_name}")
         self.resize(720, 620)
@@ -254,7 +286,7 @@ class EmulatorWindow(QMainWindow):
         self._display_fps = 0.0
         self._speed_ratio = 0.0
         self._zoom_factor = 4
-        self._palette_key = "gray"
+        self._palette_key = self._default_palette_key()
         self._key_bindings = dict(self.emulator.system.default_key_bindings)
         self._key_binding_codes: dict[int, str] = {}
         self._run_timer = QTimer(self)
@@ -329,9 +361,14 @@ class EmulatorWindow(QMainWindow):
         self._palette_key = self._load_session_palette()
         self._key_bindings = self._load_session_key_bindings()
         self._rebuild_key_binding_codes()
-        self.display_widget.set_palette(self._palette_key)
+        self.display_widget.set_color_mode(self._palette_key)
         self._apply_zoom(self._zoom_factor, persist=False)
-        self._autoload_default_media()
+        self.menuBar().clear()
+        self._build_menu_bar()
+        if self._initial_media_path:
+            self._load_media_path(self._initial_media_path, system_key=self.emulator.system.key, allow_system_switch=False)
+        elif self._autoload_enabled:
+            self._autoload_default_media()
         self.refresh()
 
     def _create_table(self, rows: int, columns: int, headers: list[str]) -> QTableWidget:
@@ -359,7 +396,7 @@ class EmulatorWindow(QMainWindow):
     def _build_menu_bar(self) -> None:
         self._file_menu = self.menuBar().addMenu("&File")
         file_menu = self._file_menu
-        self._add_menu_action(file_menu, f"Load {self.emulator.system.media_label}", self.load_media, "Ctrl+O")
+        self._add_menu_action(file_menu, "Load ROM", self.load_media, "Ctrl+O")
         self._recent_media_menu = file_menu.addMenu("Load Recent")
         self._rebuild_recent_media_menu()
         file_menu.addSeparator()
@@ -379,7 +416,20 @@ class EmulatorWindow(QMainWindow):
         emu_menu.addSeparator()
         self._add_menu_action(emu_menu, "Configure Controls", self.configure_controls)
 
-        view_menu = self.menuBar().addMenu("&View")
+        core_menu = self.menuBar().addMenu("&Core Settings")
+        gb_core_menu = core_menu.addMenu("Default GB ROM Core")
+        gb_core_group = QActionGroup(self)
+        gb_core_group.setExclusive(True)
+        preferred_gb_core = self._load_preferred_gb_rom_core()
+        for system_key in ("gameboy", "gbc"):
+            action = QAction(SUPPORTED_SYSTEMS[system_key].display_name, self)
+            action.setCheckable(True)
+            action.setChecked(system_key == preferred_gb_core)
+            action.triggered.connect(lambda checked, system_key=system_key: self._set_preferred_gb_rom_core(system_key) if checked else None)
+            gb_core_group.addAction(action)
+            gb_core_menu.addAction(action)
+
+        zoom_menu = core_menu.addMenu("Zoom")
         zoom_group = QActionGroup(self)
         zoom_group.setExclusive(True)
         for scale in (1, 2, 4):
@@ -388,18 +438,22 @@ class EmulatorWindow(QMainWindow):
             action.setChecked(scale == self._zoom_factor)
             action.triggered.connect(lambda checked, scale=scale: self._apply_zoom(scale) if checked else None)
             zoom_group.addAction(action)
-            view_menu.addAction(action)
+            zoom_menu.addAction(action)
 
-        palette_menu = view_menu.addMenu("Palette")
-        palette_group = QActionGroup(self)
-        palette_group.setExclusive(True)
-        for palette_key, (label, _colors) in PALETTE_PRESETS.items():
-            action = QAction(label, self)
-            action.setCheckable(True)
-            action.setChecked(palette_key == self._palette_key)
-            action.triggered.connect(lambda checked, palette_key=palette_key: self._apply_palette(palette_key) if checked else None)
-            palette_group.addAction(action)
-            palette_menu.addAction(action)
+        for setting in self.emulator.system.core_settings:
+            setting_menu = core_menu.addMenu(setting.label)
+            setting_group = QActionGroup(self)
+            setting_group.setExclusive(True)
+            current_value = self._current_core_setting_value(setting.key)
+            for option in setting.options:
+                action = QAction(option.label, self)
+                action.setCheckable(True)
+                action.setChecked(option.key == current_value)
+                action.triggered.connect(
+                    lambda checked, setting_key=setting.key, option_key=option.key: self._apply_core_setting(setting_key, option_key) if checked else None
+                )
+                setting_group.addAction(action)
+                setting_menu.addAction(action)
 
         debug_menu = self.menuBar().addMenu("&Debug")
         self._add_menu_action(debug_menu, "Open Debugger", self._show_debugger_window, "Ctrl+D")
@@ -426,7 +480,7 @@ class EmulatorWindow(QMainWindow):
         self._recent_media_menu.clear()
         self._recent_media_actions.clear()
 
-        recent_items = self._load_recent_media_paths()
+        recent_items = self._load_recent_media_entries()
         self._recent_media_menu.setEnabled(bool(recent_items))
         if not recent_items:
             empty_action = QAction("(empty)", self)
@@ -435,27 +489,65 @@ class EmulatorWindow(QMainWindow):
             self._recent_media_actions.append(empty_action)
             return
 
-        for recent_path in recent_items:
+        for entry in recent_items:
+            recent_path = entry["path"]
+            system_key = entry["system_key"]
             label = Path(recent_path).name
-            action = QAction(label, self)
+            system_label = SUPPORTED_SYSTEMS.get(system_key, self.emulator.system).display_name
+            action = QAction(f"{label} [{system_label}]", self)
             action.setToolTip(recent_path)
-            action.triggered.connect(lambda checked=False, path=recent_path: self._load_media_path(path))
+            action.triggered.connect(
+                lambda checked=False, path=recent_path, system_key=system_key: self._load_media_path(path, system_key=system_key)
+            )
             self._recent_media_menu.addAction(action)
             self._recent_media_actions.append(action)
 
-    def _load_recent_media_paths(self) -> list[str]:
+    def _load_recent_media_entries(self) -> list[dict[str, str]]:
         entries = self._load_session().get("recent_media", [])
         if not isinstance(entries, list):
             return []
-        results: list[str] = []
+        results: list[dict[str, str]] = []
         for entry in entries:
-            if not isinstance(entry, str):
+            path_value = ""
+            system_key = self.emulator.system.key
+            if isinstance(entry, dict):
+                raw_path = entry.get("path")
+                raw_system = entry.get("system_key")
+                if isinstance(raw_path, str):
+                    path_value = raw_path
+                if isinstance(raw_system, str) and raw_system in SUPPORTED_SYSTEMS:
+                    system_key = raw_system
+            elif isinstance(entry, str):
+                path_value = entry
+            if not path_value:
                 continue
-            candidate = Path(entry).expanduser()
+            candidate = Path(path_value).expanduser()
             if candidate.exists():
-                results.append(str(candidate))
+                results.append({"path": str(candidate), "system_key": system_key})
         return results[:8]
 
+    def _default_palette_key(self) -> str:
+        setting = self.emulator.system.core_setting_map.get("display_palette")
+        if setting is None:
+            return "native" if self.emulator.system.key == "gbc" else "gray"
+        return setting.default
+
+    def _load_preferred_gb_rom_core(self) -> str:
+        saved = self._load_session().get("preferred_gb_rom_core")
+        if isinstance(saved, str) and saved in {"gameboy", "gbc"}:
+            return saved
+        return "gameboy"
+
+    def _set_preferred_gb_rom_core(self, system_key: str) -> None:
+        if system_key not in {"gameboy", "gbc"}:
+            return
+        self._save_session(preferred_gb_rom_core=system_key)
+
+    def _current_core_setting_value(self, setting_key: str) -> str:
+        if setting_key == "display_palette":
+            return self._palette_key
+        setting = self.emulator.system.core_setting_map.get(setting_key)
+        return setting.default if setting is not None else ""
 
     def _apply_zoom(self, scale: int, persist: bool = True) -> None:
         self._zoom_factor = scale
@@ -468,13 +560,17 @@ class EmulatorWindow(QMainWindow):
         self.adjustSize()
         self.setFixedSize(self.sizeHint())
 
-    def _apply_palette(self, palette_key: str, persist: bool = True) -> None:
-        if palette_key not in PALETTE_PRESETS:
-            palette_key = "gray"
-        self._palette_key = palette_key
-        self.display_widget.set_palette(palette_key)
+    def _apply_core_setting(self, setting_key: str, option_key: str, persist: bool = True) -> None:
+        setting = self.emulator.system.core_setting_map.get(setting_key)
+        if setting is None:
+            return
+        if option_key not in setting.option_map:
+            option_key = setting.default
+        if setting_key == "display_palette":
+            self._palette_key = option_key
+            self.display_widget.set_color_mode(option_key)
         if persist:
-            self._save_session(palette_key=palette_key)
+            self._save_core_setting(setting_key, option_key)
 
     def _build_debugger_window(self) -> QMainWindow:
         window = QMainWindow(self)
@@ -505,7 +601,7 @@ class EmulatorWindow(QMainWindow):
         row = QHBoxLayout(group)
 
         buttons = [
-            (f"Load {self.emulator.system.media_label}", self.load_media),
+            ("Load ROM", self.load_media),
             ("Save State", self.save_state),
             ("Load State", self.load_state),
             ("Rewind", self.rewind_state),
@@ -1104,23 +1200,58 @@ class EmulatorWindow(QMainWindow):
         except OSError:
             pass
 
-    def _load_last_media_path(self) -> Path | None:
-        path = self._load_session().get("last_media_path")
-        if not path:
-            return None
+    def _load_last_media_entry(self) -> tuple[Path | None, str | None]:
+        session = self._load_session()
+        path = session.get("last_media_path")
+        system_key = session.get("last_system_key")
+        if not isinstance(path, str) or not path:
+            return None, system_key if isinstance(system_key, str) else None
         candidate = Path(path).expanduser()
-        return candidate if candidate.exists() else None
+        if not candidate.exists():
+            return None, system_key if isinstance(system_key, str) else None
+        return candidate, system_key if isinstance(system_key, str) else None
 
     def _load_session_zoom(self) -> int:
         zoom = self._load_session().get("zoom_factor", self._zoom_factor)
         return zoom if zoom in (1, 2, 4) else self._zoom_factor
 
     def _load_session_palette(self) -> str:
-        palette_key = self._load_session().get("palette_key", self._palette_key)
-        return palette_key if palette_key in PALETTE_PRESETS else self._palette_key
+        setting = self.emulator.system.core_setting_map.get("display_palette")
+        if setting is None:
+            return self._default_palette_key()
+        core_settings = self._load_session().get("core_settings", {})
+        if isinstance(core_settings, dict):
+            system_settings = core_settings.get(self.emulator.system.key, {})
+            if isinstance(system_settings, dict):
+                saved = system_settings.get(setting.key)
+                if isinstance(saved, str) and saved in setting.option_map:
+                    return saved
+        return setting.default
+
+    def _save_core_setting(self, setting_key: str, option_key: str) -> None:
+        payload = self._load_session()
+        section = payload.get("core_settings", {})
+        if not isinstance(section, dict):
+            section = {}
+        system_settings = section.get(self.emulator.system.key, {})
+        if not isinstance(system_settings, dict):
+            system_settings = {}
+        system_settings[setting_key] = option_key
+        section[self.emulator.system.key] = system_settings
+        payload["core_settings"] = section
+        try:
+            self._session_path.write_text(json.dumps(payload, indent=2))
+        except OSError:
+            pass
 
     def _load_session_key_bindings(self) -> dict[str, str]:
-        saved = self._load_session().get("key_bindings", {})
+        session = self._load_session()
+        saved_by_system = session.get("key_bindings_by_system", {})
+        saved = session.get("key_bindings", {})
+        if isinstance(saved_by_system, dict):
+            candidate = saved_by_system.get(self.emulator.system.key, {})
+            if isinstance(candidate, dict):
+                saved = candidate
         bindings = dict(self.emulator.system.default_key_bindings)
         if isinstance(saved, dict):
             for action in self.emulator.system.input_actions:
@@ -1146,13 +1277,23 @@ class EmulatorWindow(QMainWindow):
             return
         self._key_bindings = dialog.key_bindings()
         self._rebuild_key_binding_codes()
-        self._save_session(key_bindings=self._key_bindings)
+        payload = self._load_session()
+        bindings_by_system = payload.get("key_bindings_by_system", {})
+        if not isinstance(bindings_by_system, dict):
+            bindings_by_system = {}
+        bindings_by_system[self.emulator.system.key] = self._key_bindings
+        self._save_session(key_bindings_by_system=bindings_by_system)
 
-    def _save_last_media_path(self, path: str) -> None:
+    def _save_last_media_path(self, path: str, system_key: str | None = None) -> None:
         normalized = str(Path(path).expanduser())
-        recent = [item for item in self._load_recent_media_paths() if item != normalized]
-        recent.insert(0, normalized)
-        self._save_session(last_media_path=normalized, recent_media=recent[:8])
+        selected_system = system_key or self.emulator.system.key
+        recent = [
+            item
+            for item in self._load_recent_media_entries()
+            if not (item["path"] == normalized and item["system_key"] == selected_system)
+        ]
+        recent.insert(0, {"path": normalized, "system_key": selected_system})
+        self._save_session(last_media_path=normalized, last_system_key=selected_system, recent_media=recent[:8])
         self._rebuild_recent_media_menu()
 
     def _write_wav(self, path: Path, audio_buffer: AudioBuffer) -> None:
@@ -1217,23 +1358,74 @@ class EmulatorWindow(QMainWindow):
 
         return "HALT wait: no enabled interrupt is pending yet"
 
+    def _choose_system_for_media(self, path: str, preferred_system: str | None = None, prompt: bool = True) -> str | None:
+        candidates = compatible_system_keys_for_media(path)
+        if preferred_system in candidates:
+            return preferred_system
+        if not candidates:
+            return self.emulator.system.key
+        if len(candidates) == 1:
+            return candidates[0]
+        if set(candidates) == {"gameboy", "gbc"}:
+            default_gb_core = self._load_preferred_gb_rom_core()
+            if default_gb_core in candidates:
+                return default_gb_core
+        if not prompt:
+            if self.emulator.system.key in candidates:
+                return self.emulator.system.key
+            return candidates[0]
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Choose Core")
+        dialog.setText(f"Load {Path(path).name} with which core?")
+        buttons: dict[QAbstractButton, str] = {}
+        for system_key in candidates:
+            button = dialog.addButton(SUPPORTED_SYSTEMS[system_key].display_name, QMessageBox.ButtonRole.AcceptRole)
+            buttons[button] = system_key
+            if system_key == self.emulator.system.key:
+                dialog.setDefaultButton(button)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        return buttons.get(clicked)
+
+    def _open_replacement_window(self, system_key: str, media_path: str) -> None:
+        replacement = EmulatorWindow(system=system_key, initial_media_path=media_path, autoload=False)
+        replacement.setGeometry(self.geometry())
+        if self.debugger_window.isVisible():
+            replacement._show_debugger_window()
+            replacement.debugger_window.setGeometry(self.debugger_window.geometry())
+        replacement.show()
+        replacement.raise_()
+        replacement.activateWindow()
+        self._replacement_window = replacement
+        self.debugger_window.close()
+        self.close()
+
     def _autoload_default_media(self) -> None:
-        last_media = self._load_last_media_path()
-        candidates = []
+        last_media, last_system = self._load_last_media_entry()
+        candidates: list[tuple[Path, str | None]] = []
         if last_media is not None:
-            candidates.append(last_media)
+            candidates.append((last_media, last_system))
         candidates.extend([
-            Path.cwd() / "tetris.gb",
-            Path.cwd() / "TETRIS.GB",
-            Path.cwd() / "tetris.gbc",
-            Path.cwd() / "tetris.zip",
-            Path.cwd() / "TETRIS.ZIP",
+            (Path.cwd() / "tetris.gb", None),
+            (Path.cwd() / "TETRIS.GB", None),
+            (Path.cwd() / "tetris.gbc", None),
+            (Path.cwd() / "tetris.zip", None),
+            (Path.cwd() / "TETRIS.ZIP", None),
         ])
-        for candidate in candidates:
+        for candidate, preferred_system in candidates:
             if candidate.exists():
+                selected_system = self._choose_system_for_media(str(candidate), preferred_system=preferred_system, prompt=False)
+                if selected_system != self.emulator.system.key:
+                    continue
                 self._reset_display_and_input_state()
-                if self.emulator.load_media(str(candidate)):
-                    self._save_last_media_path(str(candidate))
+                try:
+                    loaded = self.emulator.load_media(str(candidate))
+                except ValueError:
+                    loaded = False
+                if loaded:
+                    self._save_last_media_path(str(candidate), system_key=selected_system)
                     self._clear_rewind_history()
                     self._record_rewind_snapshot(force=True)
                     self._trace_frame_counter = 0
@@ -1244,17 +1436,26 @@ class EmulatorWindow(QMainWindow):
 
     def load_media(self) -> None:
         self.pause_running()
+        all_extensions = sorted({ext for system in SUPPORTED_SYSTEMS.values() for ext in system.media_extensions})
+        patterns = " ".join(f"*.{extension}" for extension in all_extensions)
         path, _ = QFileDialog.getOpenFileName(
             self,
-            f"Select {self.emulator.system.media_label}",
+            "Select ROM",
             str(Path.cwd()),
-            self.emulator.system.file_dialog_filter,
+            f"ROM files ({patterns});;All files (*.*)",
         )
         if not path:
             return
         self._load_media_path(path)
 
-    def _load_media_path(self, path: str) -> None:
+    def _load_media_path(self, path: str, system_key: str | None = None, allow_system_switch: bool = True) -> None:
+        selected_system = self._choose_system_for_media(path, preferred_system=system_key, prompt=system_key is None)
+        if selected_system is None:
+            return
+        if allow_system_switch and selected_system != self.emulator.system.key:
+            self._save_last_media_path(path, system_key=selected_system)
+            self._open_replacement_window(selected_system, path)
+            return
         self.pause_running()
         self._reset_display_and_input_state()
         try:
@@ -1265,7 +1466,7 @@ class EmulatorWindow(QMainWindow):
         if not loaded:
             QMessageBox.warning(self, "Load failed", f"The selected {self.emulator.system.media_label.lower()} could not be loaded.")
             return
-        self._save_last_media_path(path)
+        self._save_last_media_path(path, system_key=selected_system)
         self._clear_rewind_history()
         self._record_rewind_snapshot(force=True)
         self._trace_frame_counter = 0
@@ -1713,6 +1914,6 @@ class EmulatorWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
-    window = EmulatorWindow()
+    window = EmulatorWindow(system=_preferred_system_key_from_session())
     window.show()
     return app.exec()

@@ -164,6 +164,24 @@ class DebugFlagInfo:
 
 
 @dataclass(frozen=True)
+class CoreSettingOptionInfo:
+    key: str
+    label: str
+
+
+@dataclass(frozen=True)
+class CoreSettingInfo:
+    key: str
+    label: str
+    options: tuple[CoreSettingOptionInfo, ...]
+    default: str
+
+    @property
+    def option_map(self) -> dict[str, CoreSettingOptionInfo]:
+        return {option.key: option for option in self.options}
+
+
+@dataclass(frozen=True)
 class SystemInfo:
     key: str
     display_name: str
@@ -180,6 +198,7 @@ class SystemInfo:
     debug_watch_entries: tuple[DebugWatchInfo, ...]
     debug_registers: tuple[DebugRegisterInfo, ...]
     debug_flags: tuple[DebugFlagInfo, ...]
+    core_settings: tuple[CoreSettingInfo, ...] = ()
 
     @property
     def file_dialog_filter(self) -> str:
@@ -194,6 +213,10 @@ class SystemInfo:
     def debug_memory_region_map(self) -> dict[str, DebugMemoryRegionInfo]:
         return {region.label: region for region in self.debug_memory_regions}
 
+    @property
+    def core_setting_map(self) -> dict[str, CoreSettingInfo]:
+        return {setting.key: setting for setting in self.core_settings}
+
 
 @dataclass
 class MediaInfo:
@@ -203,6 +226,75 @@ class MediaInfo:
     size_bytes: int = 0
 
 
+DMG_PALETTE_SETTING = CoreSettingInfo(
+    key="display_palette",
+    label="Display Palette",
+    options=(
+        CoreSettingOptionInfo("gray", "DMG Gray"),
+        CoreSettingOptionInfo("green", "DMG Green"),
+        CoreSettingOptionInfo("pocket", "Pocket"),
+        CoreSettingOptionInfo("blue", "Cool Blue"),
+        CoreSettingOptionInfo("amber", "Amber"),
+    ),
+    default="gray",
+)
+
+
+GBC_COLOR_SETTING = CoreSettingInfo(
+    key="display_palette",
+    label="Display Colors",
+    options=(
+        CoreSettingOptionInfo("native", "Native Color"),
+    ),
+    default="native",
+)
+
+
+def compatible_system_keys_for_media(path: str) -> list[str]:
+    media_path = Path(path)
+    suffix = media_path.suffix.lower().lstrip('.')
+    if not suffix:
+        return []
+    if suffix == 'zip':
+        try:
+            with zipfile.ZipFile(media_path) as archive:
+                inner_suffixes = {
+                    PurePosixPath(member.filename).suffix.lower().lstrip('.')
+                    for member in archive.infolist()
+                    if not member.is_dir() and PurePosixPath(member.filename).suffix
+                }
+        except (OSError, zipfile.BadZipFile):
+            inner_suffixes = set()
+        if 'gbc' in inner_suffixes:
+            return ['gbc']
+        if 'gb' in inner_suffixes:
+            return ['gameboy', 'gbc']
+        return [
+            key
+            for key, system in SUPPORTED_SYSTEMS.items()
+            if 'zip' in system.media_extensions
+        ]
+    if suffix == 'gb':
+        preferred = ('gameboy', 'gbc')
+    elif suffix == 'gbc':
+        preferred = ('gbc',)
+    else:
+        preferred = tuple(SUPPORTED_SYSTEMS.keys())
+
+    matches = [
+        key
+        for key in preferred
+        if key in SUPPORTED_SYSTEMS and suffix in SUPPORTED_SYSTEMS[key].media_extensions
+    ]
+    if matches:
+        return matches
+    return [
+        key
+        for key, system in SUPPORTED_SYSTEMS.items()
+        if suffix in system.media_extensions
+    ]
+
+
 SUPPORTED_SYSTEMS: dict[str, SystemInfo] = {
     "gameboy": SystemInfo(
         key="gameboy",
@@ -210,6 +302,79 @@ SUPPORTED_SYSTEMS: dict[str, SystemInfo] = {
         screen_width=160,
         screen_height=144,
         cpu_hz=4_194_304,
+        frame_rate=59.7275,
+        media_label="Game Boy ROM",
+        media_extensions=("gb", "zip"),
+        input_actions=(
+            InputActionInfo("up", "Up", "directions", 0x04, 0, 1),
+            InputActionInfo("left", "Left", "directions", 0x02, 1, 0),
+            InputActionInfo("down", "Down", "directions", 0x08, 1, 1),
+            InputActionInfo("right", "Right", "directions", 0x01, 1, 2),
+            InputActionInfo("a", "A", "buttons", 0x01, 0, 3),
+            InputActionInfo("b", "B", "buttons", 0x02, 0, 4),
+            InputActionInfo("select", "Select", "buttons", 0x04, 1, 3),
+            InputActionInfo("start", "Start", "buttons", 0x08, 1, 4),
+        ),
+        default_key_bindings={
+            "a": "Z",
+            "b": "X",
+            "select": "Backspace",
+            "start": "Return",
+            "up": "Up",
+            "down": "Down",
+            "left": "Left",
+            "right": "Right",
+        },
+        default_joystick_bindings={
+            "a": "button:0",
+            "b": "button:1",
+            "select": "button:6",
+            "start": "button:7",
+            "up": "hat0:up|axis1:-",
+            "down": "hat0:down|axis1:+",
+            "left": "hat0:left|axis0:-",
+            "right": "hat0:right|axis0:+",
+        },
+        debug_memory_regions=(
+            DebugMemoryRegionInfo("vram", "VRAM", 0x8000, 0xA000, True),
+            DebugMemoryRegionInfo("ram", "RAM", 0xC000, 0xE000, True),
+            DebugMemoryRegionInfo("hram", "HRAM", 0xFF80, 0x10000, True),
+            DebugMemoryRegionInfo("io", "IO", 0xFF00, 0xFF80, True),
+        ),
+        debug_watch_entries=(
+            DebugWatchInfo("last_opcode", "last opcode", "memory8", 0xC000),
+            DebugWatchInfo("entrypoint", "entrypoint", "memory8", 0x0100),
+            DebugWatchInfo("joypad", "joypad FF00", "memory8", 0xFF00),
+            DebugWatchInfo("buttons", "buttons", "input_buttons"),
+            DebugWatchInfo("directions", "directions", "input_directions"),
+            DebugWatchInfo("ie_if", "IE/IF", "memory8_pair", 0xFFFF, 0xFF0F),
+            DebugWatchInfo("ff82", "FF82 handshake", "memory8", 0xFF82),
+            DebugWatchInfo("ff97", "FF97 counter", "memory8", 0xFF97),
+            DebugWatchInfo("ff9b", "FF9B state", "memory8", 0xFF9B),
+            DebugWatchInfo("a298", "A298 save byte", "memory8", 0xA298),
+        ),
+        debug_registers=(
+            DebugRegisterInfo("pc", "PC", "u16_attr", attr="pc"),
+            DebugRegisterInfo("sp", "SP", "u16_attr", attr="sp"),
+            DebugRegisterInfo("af", "AF", "u8_pair", hi_attr="a", lo_attr="f"),
+            DebugRegisterInfo("bc", "BC", "u8_pair", hi_attr="b", lo_attr="c"),
+            DebugRegisterInfo("de", "DE", "u8_pair", hi_attr="d", lo_attr="e"),
+            DebugRegisterInfo("hl", "HL", "u8_pair", hi_attr="h", lo_attr="l"),
+        ),
+        debug_flags=(
+            DebugFlagInfo("z", "Z", 0x80),
+            DebugFlagInfo("n", "N", 0x40),
+            DebugFlagInfo("h", "H", 0x20),
+            DebugFlagInfo("c", "C", 0x10),
+        ),
+        core_settings=(DMG_PALETTE_SETTING,),
+    ),
+    "gbc": SystemInfo(
+        key="gbc",
+        display_name="Nintendo Game Boy Color",
+        screen_width=160,
+        screen_height=144,
+        cpu_hz=8_388_608,
         frame_rate=59.7275,
         media_label="Game Boy ROM",
         media_extensions=("gb", "gbc", "zip"),
@@ -275,7 +440,8 @@ SUPPORTED_SYSTEMS: dict[str, SystemInfo] = {
             DebugFlagInfo("h", "H", 0x20),
             DebugFlagInfo("c", "C", 0x10),
         ),
-    )
+        core_settings=(GBC_COLOR_SETTING,),
+    ),
 }
 
 
@@ -283,7 +449,9 @@ class Emulator:
     def __init__(self, system: str = "gameboy") -> None:
         if system not in SUPPORTED_SYSTEMS:
             available = ", ".join(sorted(SUPPORTED_SYSTEMS))
-            raise ValueError(f"Unsupported system '{system}'. Available systems: {available}")
+            raise ValueError(
+                f"Unsupported system '{system}'. Available systems: {available}"
+            )
 
         self._system = SUPPORTED_SYSTEMS[system]
         self._temp_dir = tempfile.TemporaryDirectory(prefix="pyemu-media-")
@@ -416,17 +584,30 @@ class Emulator:
         if path.suffix.lower() != ".zip":
             return path
 
-        rom_extensions = {f".{extension.lower()}" for extension in self._system.media_extensions if extension.lower() != "zip"}
+        rom_extensions = {
+            f".{extension.lower()}"
+            for extension in self._system.media_extensions
+            if extension.lower() != "zip"
+        }
         with zipfile.ZipFile(path) as archive:
             candidates = [
                 member
                 for member in archive.infolist()
-                if not member.is_dir() and PurePosixPath(member.filename).suffix.lower() in rom_extensions
+                if not member.is_dir()
+                and PurePosixPath(member.filename).suffix.lower() in rom_extensions
             ]
             if not candidates:
-                raise ValueError(f"No supported {self._system.media_label.lower()} found inside {path.name}.")
+                raise ValueError(
+                    f"No supported {self._system.media_label.lower()} found inside {path.name}."
+                )
 
-            candidates.sort(key=lambda member: (PurePosixPath(member.filename).parts.__len__(), member.file_size, member.filename.lower()))
+            candidates.sort(
+                key=lambda member: (
+                    PurePosixPath(member.filename).parts.__len__(),
+                    member.file_size,
+                    member.filename.lower(),
+                )
+            )
             member = candidates[0]
             target_dir = Path(self._temp_dir.name) / path.stem
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -491,16 +672,26 @@ class _NativeEmulator:
         pcm = b""
         if audio.samples != self._ffi.NULL and int(audio.sample_count) > 0:
             pcm = bytes(self._ffi.buffer(audio.samples, int(audio.sample_count) * 2))
-        return AudioBuffer(sample_rate=int(audio.sample_rate), channels=int(audio.channels), pcm16le=pcm)
+        return AudioBuffer(
+            sample_rate=int(audio.sample_rate),
+            channels=int(audio.channels),
+            pcm16le=pcm,
+        )
 
     def gameboy_audio_channel_buffer(self, channel: int) -> AudioBuffer:
         if not hasattr(self._lib, "pyemu_get_gameboy_audio_channel_buffer"):
             return AudioBuffer()
-        audio = self._lib.pyemu_get_gameboy_audio_channel_buffer(self._handle, int(channel))
+        audio = self._lib.pyemu_get_gameboy_audio_channel_buffer(
+            self._handle, int(channel)
+        )
         pcm = b""
         if audio.samples != self._ffi.NULL and int(audio.sample_count) > 0:
             pcm = bytes(self._ffi.buffer(audio.samples, int(audio.sample_count) * 2))
-        return AudioBuffer(sample_rate=int(audio.sample_rate), channels=int(audio.channels), pcm16le=pcm)
+        return AudioBuffer(
+            sample_rate=int(audio.sample_rate),
+            channels=int(audio.channels),
+            pcm16le=pcm,
+        )
 
     @property
     def gameboy_audio_debug(self) -> GameBoyAudioDebugInfo:
@@ -511,15 +702,43 @@ class _NativeEmulator:
             return GameBoyAudioDebugInfo()
         value = info[0]
         return GameBoyAudioDebugInfo(
-            nr10=int(value.nr10), nr11=int(value.nr11), nr12=int(value.nr12), nr13=int(value.nr13), nr14=int(value.nr14),
-            nr21=int(value.nr21), nr22=int(value.nr22), nr23=int(value.nr23), nr24=int(value.nr24),
-            nr30=int(value.nr30), nr32=int(value.nr32), nr33=int(value.nr33), nr34=int(value.nr34),
-            nr41=int(value.nr41), nr42=int(value.nr42), nr43=int(value.nr43), nr44=int(value.nr44),
-            nr50=int(value.nr50), nr51=int(value.nr51), nr52=int(value.nr52),
-            ch1_enabled=bool(value.ch1_enabled), ch1_duty=int(value.ch1_duty), ch1_volume=int(value.ch1_volume), ch1_frequency_raw=int(value.ch1_frequency_raw),
-            ch2_enabled=bool(value.ch2_enabled), ch2_duty=int(value.ch2_duty), ch2_volume=int(value.ch2_volume), ch2_frequency_raw=int(value.ch2_frequency_raw),
-            ch3_enabled=bool(value.ch3_enabled), ch3_volume_code=int(value.ch3_volume_code), ch3_frequency_raw=int(value.ch3_frequency_raw),
-            ch4_enabled=bool(value.ch4_enabled), ch4_volume=int(value.ch4_volume), ch4_width_mode=int(value.ch4_width_mode), ch4_divisor_code=int(value.ch4_divisor_code), ch4_clock_shift=int(value.ch4_clock_shift), ch4_lfsr=int(value.ch4_lfsr),
+            nr10=int(value.nr10),
+            nr11=int(value.nr11),
+            nr12=int(value.nr12),
+            nr13=int(value.nr13),
+            nr14=int(value.nr14),
+            nr21=int(value.nr21),
+            nr22=int(value.nr22),
+            nr23=int(value.nr23),
+            nr24=int(value.nr24),
+            nr30=int(value.nr30),
+            nr32=int(value.nr32),
+            nr33=int(value.nr33),
+            nr34=int(value.nr34),
+            nr41=int(value.nr41),
+            nr42=int(value.nr42),
+            nr43=int(value.nr43),
+            nr44=int(value.nr44),
+            nr50=int(value.nr50),
+            nr51=int(value.nr51),
+            nr52=int(value.nr52),
+            ch1_enabled=bool(value.ch1_enabled),
+            ch1_duty=int(value.ch1_duty),
+            ch1_volume=int(value.ch1_volume),
+            ch1_frequency_raw=int(value.ch1_frequency_raw),
+            ch2_enabled=bool(value.ch2_enabled),
+            ch2_duty=int(value.ch2_duty),
+            ch2_volume=int(value.ch2_volume),
+            ch2_frequency_raw=int(value.ch2_frequency_raw),
+            ch3_enabled=bool(value.ch3_enabled),
+            ch3_volume_code=int(value.ch3_volume_code),
+            ch3_frequency_raw=int(value.ch3_frequency_raw),
+            ch4_enabled=bool(value.ch4_enabled),
+            ch4_volume=int(value.ch4_volume),
+            ch4_width_mode=int(value.ch4_width_mode),
+            ch4_divisor_code=int(value.ch4_divisor_code),
+            ch4_clock_shift=int(value.ch4_clock_shift),
+            ch4_lfsr=int(value.ch4_lfsr),
         )
 
     @property
@@ -528,8 +747,12 @@ class _NativeEmulator:
         path_ptr = self._lib.pyemu_get_rom_path(self._handle)
         return MediaInfo(
             loaded=bool(self._lib.pyemu_has_rom_loaded(self._handle)),
-            path=self._ffi.string(path_ptr).decode("utf-8") if path_ptr != self._ffi.NULL else "",
-            title=self._ffi.string(title_ptr).decode("utf-8") if title_ptr != self._ffi.NULL else "",
+            path=self._ffi.string(path_ptr).decode("utf-8")
+            if path_ptr != self._ffi.NULL
+            else "",
+            title=self._ffi.string(title_ptr).decode("utf-8")
+            if title_ptr != self._ffi.NULL
+            else "",
             size_bytes=int(self._lib.pyemu_get_rom_size(self._handle)),
         )
 
@@ -587,11 +810,15 @@ class _NativeEmulator:
 
     def poke_memory(self, address: int, value: int) -> None:
         if hasattr(self._lib, "pyemu_poke_memory"):
-            self._lib.pyemu_poke_memory(self._handle, int(address) & 0xFFFF, int(value) & 0xFF)
+            self._lib.pyemu_poke_memory(
+                self._handle, int(address) & 0xFFFF, int(value) & 0xFF
+            )
 
     def set_gameboy_joypad_state(self, buttons: int, directions: int) -> None:
         if hasattr(self._lib, "pyemu_set_gameboy_joypad_state"):
-            self._lib.pyemu_set_gameboy_joypad_state(self._handle, int(buttons) & 0x0F, int(directions) & 0x0F)
+            self._lib.pyemu_set_gameboy_joypad_state(
+                self._handle, int(buttons) & 0x0F, int(directions) & 0x0F
+            )
 
     def set_bus_tracking(self, enabled: bool) -> None:
         if hasattr(self._lib, "pyemu_set_bus_tracking"):
@@ -613,7 +840,12 @@ class _NativeEmulator:
         handle = getattr(self, "_handle", None)
         ffi = getattr(self, "_ffi", None)
         lib = getattr(self, "_lib", None)
-        if handle is not None and ffi is not None and lib is not None and handle != ffi.NULL:
+        if (
+            handle is not None
+            and ffi is not None
+            and lib is not None
+            and handle != ffi.NULL
+        ):
             with suppress(Exception):
                 lib.pyemu_destroy(handle)
             self._handle = ffi.NULL
@@ -625,7 +857,9 @@ class _FallbackEmulator:
         self.system_name = system.key
         self.run_state = RunState.STOPPED
         self.cpu_state = CPUState(pc=0x0100, sp=0xFFFE)
-        self.frame_buffer = FrameBuffer(width=system.screen_width, height=system.screen_height)
+        self.frame_buffer = FrameBuffer(
+            width=system.screen_width, height=system.screen_height
+        )
         self.audio_buffer = AudioBuffer()
         self.gameboy_audio_debug = GameBoyAudioDebugInfo()
         self.gameboy_audio_debug = GameBoyAudioDebugInfo()
@@ -637,7 +871,9 @@ class _FallbackEmulator:
     def reset(self) -> None:
         self.run_state = RunState.PAUSED
         self.cpu_state = CPUState(pc=0x0100, sp=0xFFFE)
-        self.frame_buffer = FrameBuffer(width=self._system.screen_width, height=self._system.screen_height)
+        self.frame_buffer = FrameBuffer(
+            width=self._system.screen_width, height=self._system.screen_height
+        )
         self.audio_buffer = AudioBuffer()
         self._memory = [0] * 0x10000
         self.cycle_count = 0
@@ -646,10 +882,19 @@ class _FallbackEmulator:
     def load_media(self, path: str) -> bool:
         self.run_state = RunState.PAUSED
         if path:
-            title_bytes = b"TETRIS" if Path(path).stem.lower().startswith("tetris") else b"PYEMU DEMO"
+            title_bytes = (
+                b"TETRIS"
+                if Path(path).stem.lower().startswith("tetris")
+                else b"PYEMU DEMO"
+            )
             for offset, value in enumerate(title_bytes):
                 self._memory[0x0134 + offset] = value
-            self.media = MediaInfo(loaded=True, path=path, title=title_bytes.decode("ascii"), size_bytes=0x8000)
+            self.media = MediaInfo(
+                loaded=True,
+                path=path,
+                title=title_bytes.decode("ascii"),
+                size_bytes=0x8000,
+            )
             return True
         return False
 
@@ -682,7 +927,11 @@ class _FallbackEmulator:
         for y in range(self.frame_buffer.height):
             for x in range(self.frame_buffer.width):
                 pixel = (y * self.frame_buffer.width + x) * 4
-                shade = self._memory[(x + y) & 0x7FFF] if self.media.loaded else (x + y + self.cpu_state.a) % 255
+                shade = (
+                    self._memory[(x + y) & 0x7FFF]
+                    if self.media.loaded
+                    else (x + y + self.cpu_state.a) % 255
+                )
                 rgba[pixel : pixel + 4] = [shade, shade, shade, 255]
         self.frame_buffer.rgba = rgba
         self.step_instruction()
@@ -867,6 +1116,16 @@ def _library_candidates() -> list[Path]:
     workspace_root = package_root.parent.parent
     if sys.platform.startswith("win"):
         return [
+            workspace_root / "build" / "native" / "pyemu_native_timed140.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed139.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed138.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed137.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed136.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed135.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed134.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed133.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed132.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed131.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed130.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed129.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed128.dll",

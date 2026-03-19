@@ -6,7 +6,8 @@ from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from .runtime import FrameBuffer, SystemInfo
 
-PALETTE_PRESETS: dict[str, tuple[str, tuple[tuple[int, int, int, int], ...]]] = {
+COLOR_MODE_PRESETS: dict[str, tuple[str, tuple[tuple[int, int, int, int], ...]]] = {
+    "native": ("Native Color", ((0, 0, 0, 255), (0, 0, 0, 255), (0, 0, 0, 255), (0, 0, 0, 255))),
     "gray": ("DMG Gray", ((255, 255, 255, 255), (170, 170, 170, 255), (85, 85, 85, 255), (0, 0, 0, 255))),
     "green": ("DMG Green", ((155, 188, 15, 255), (139, 172, 15, 255), (48, 98, 48, 255), (15, 56, 15, 255))),
     "pocket": ("Pocket", ((224, 248, 208, 255), (136, 192, 112, 255), (52, 104, 86, 255), (8, 24, 32, 255))),
@@ -22,7 +23,7 @@ class FrameBufferWidget(QWidget):
         self._image = QImage()
         self._last_frame: FrameBuffer | None = None
         self._scale = 4
-        self._palette_key = "gray"
+        self._color_mode_key = "gray"
         self._label = QLabel("No frame available")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -54,24 +55,30 @@ class FrameBufferWidget(QWidget):
         self._scale = max(1, scale)
         self.updateGeometry()
 
-    def set_palette(self, palette_key: str) -> None:
-        if palette_key not in PALETTE_PRESETS:
-            palette_key = "gray"
-        if palette_key == self._palette_key:
+    def set_color_mode(self, color_mode_key: str) -> None:
+        if color_mode_key not in COLOR_MODE_PRESETS:
+            color_mode_key = "gray"
+        if color_mode_key == self._color_mode_key:
             return
-        self._palette_key = palette_key
+        self._color_mode_key = color_mode_key
         if self._last_frame is not None:
             self.update_frame(self._last_frame)
 
+    def color_mode_key(self) -> str:
+        return self._color_mode_key
+
+    def set_palette(self, palette_key: str) -> None:
+        self.set_color_mode(palette_key)
+
     def palette_key(self) -> str:
-        return self._palette_key
+        return self.color_mode_key()
 
     def sizeHint(self) -> QSize:  # type: ignore[override]
         return QSize(self._system.screen_width * self._scale, self._system.screen_height * self._scale)
 
     def _map_palette(self, rgba: bytes) -> bytes:
-        colors = PALETTE_PRESETS.get(self._palette_key, PALETTE_PRESETS["gray"])[1]
-        if self._palette_key == "gray":
+        colors = COLOR_MODE_PRESETS.get(self._color_mode_key, COLOR_MODE_PRESETS["gray"])[1]
+        if self._color_mode_key in {"native", "gray"}:
             return rgba
         mapped = bytearray(rgba)
         for index in range(0, len(mapped), 4):

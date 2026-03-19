@@ -6,6 +6,7 @@
 
 #include "pyemu/core/system.h"
 #include "pyemu/systems/gameboy/gameboy_system.h"
+#include "pyemu/systems/gbc/gbc_system.h"
 
 struct pyemu_emulator {
     pyemu_system* system;
@@ -18,7 +19,8 @@ typedef struct pyemu_system_descriptor {
 } pyemu_system_descriptor;
 
 static const pyemu_system_descriptor PYEMU_SYSTEMS[] = {
-    {"gameboy", pyemu_gameboy_create}
+    {"gameboy", pyemu_gameboy_create},
+    {"gbc", pyemu_gbc_create}
 };
 
 static const size_t PYEMU_SYSTEM_COUNT = sizeof(PYEMU_SYSTEMS) / sizeof(PYEMU_SYSTEMS[0]);
