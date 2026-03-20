@@ -152,6 +152,7 @@ PYEMU_API pyemu_frame_buffer pyemu_get_frame_buffer(const pyemu_emulator* emulat
 PYEMU_API pyemu_audio_buffer pyemu_get_audio_buffer(const pyemu_emulator* emulator);
 PYEMU_API const uint8_t* pyemu_get_memory(const pyemu_emulator* emulator, size_t* size);
 PYEMU_API void pyemu_poke_memory(pyemu_emulator* emulator, uint16_t address, uint8_t value);
+PYEMU_API uint8_t pyemu_peek_memory(pyemu_emulator* emulator, uint16_t address);
 PYEMU_API int pyemu_has_rom_loaded(const pyemu_emulator* emulator);
 PYEMU_API const char* pyemu_get_rom_path(const pyemu_emulator* emulator);
 PYEMU_API const char* pyemu_get_cartridge_title(const pyemu_emulator* emulator);
@@ -165,4 +166,5 @@ PYEMU_API int pyemu_is_faulted(const pyemu_emulator* emulator);
 PYEMU_API pyemu_audio_buffer pyemu_get_gameboy_audio_channel_buffer(const pyemu_emulator* emulator, int channel);
 PYEMU_API int pyemu_get_gameboy_audio_debug_info(const pyemu_emulator* emulator, pyemu_gameboy_audio_debug_info* out_info);
 PYEMU_API void pyemu_set_gameboy_joypad_state(pyemu_emulator* emulator, uint8_t buttons, uint8_t directions);
+PYEMU_API void pyemu_set_gbc_joypad_state(pyemu_emulator* emulator, uint8_t buttons, uint8_t directions);
 PYEMU_API void pyemu_set_bus_tracking(pyemu_emulator* emulator, int enabled);

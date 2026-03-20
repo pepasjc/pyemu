@@ -9,7 +9,13 @@ int pyemu_gbc_uses_mbc1(const pyemu_gbc_system* gbc) {
 }
 
 int pyemu_gbc_uses_mbc3(const pyemu_gbc_system* gbc) {
-    return gbc->cartridge_type >= 0x05 && gbc->cartridge_type <= 0x06;
+    /* MBC3 types: 0x0F (MBC3+TIMER+BATT), 0x10 (MBC3+TIMER+RAM+BATT),
+     * 0x11 (MBC3), 0x12 (MBC3+RAM), 0x13 (MBC3+RAM+BATT) */
+    return gbc->cartridge_type >= 0x0F && gbc->cartridge_type <= 0x13;
+}
+
+int pyemu_gbc_uses_mbc5(const pyemu_gbc_system* gbc) {
+    return gbc->cartridge_type >= 0x19 && gbc->cartridge_type <= 0x1E;
 }
 
 int pyemu_gbc_has_battery(const pyemu_gbc_system* gbc) {
@@ -47,7 +53,7 @@ int pyemu_gbc_has_external_ram(const pyemu_gbc_system* gbc) {
 }
 
 size_t pyemu_gbc_eram_size_from_code(uint8_t ram_size_code) {
-    static const size_t sizes[] = {0, 0, 0, 0x2000, 0x8000, 0x20000, 0x10000};
+    static const size_t sizes[] = {0, 0, 0x2000, 0x8000, 0x20000, 0x10000, 0x20000};
     if (ram_size_code <= 6) {
         return sizes[ram_size_code];
     }
@@ -79,6 +85,13 @@ uint8_t pyemu_gbc_current_rom_bank(const pyemu_gbc_system* gbc) {
     if (pyemu_gbc_uses_mbc3(gbc)) {
         return gbc->mbc3_rom_bank;
     }
+    if (pyemu_gbc_uses_mbc5(gbc)) {
+        uint16_t bank = (uint16_t)(((gbc->mbc3_ram_bank & 0x01) << 8) | gbc->mbc3_rom_bank);
+        if (gbc->rom_bank_count > 1) {
+            bank = (uint16_t)(bank % gbc->rom_bank_count);
+        }
+        return (uint8_t)bank;
+    }
     return 1;
 }
 
@@ -87,6 +100,11 @@ size_t pyemu_gbc_current_eram_offset(const pyemu_gbc_system* gbc) {
     if (pyemu_gbc_uses_mbc1(gbc) && pyemu_gbc_mbc1_mode(gbc)) {
         bank = pyemu_gbc_mbc1_upper_bits(gbc);
     } else if (pyemu_gbc_uses_mbc3(gbc)) {
+        /* Only use as RAM bank index when it's a real RAM bank (0-3); 0x08-0x0C are RTC registers */
+        if (gbc->mbc3_ram_bank <= 0x03) {
+            bank = gbc->mbc3_ram_bank;
+        }
+    } else if (pyemu_gbc_uses_mbc5(gbc)) {
         bank = gbc->mbc3_ram_bank;
     }
     if (bank >= gbc->eram_bank_count) {
@@ -130,46 +148,41 @@ void pyemu_gbc_refresh_eram_window(pyemu_gbc_system* gbc) {
 }
 
 uint8_t pyemu_gbc_current_joypad_value(const pyemu_gbc_system* gbc) {
-    uint8_t result = 0xCF;
-    if ((gbc->memory[0xFF00] & 0x20) == 0) {
-        result = (uint8_t)(result & 0xF0);
-        result |= gbc->joypad_directions;
+    uint8_t select = (uint8_t)(gbc->memory[0xFF00] & 0x30);
+    uint8_t low = 0x0F;
+
+    if ((select & 0x10) == 0) {
+        low &= gbc->joypad_directions;
     }
-    if ((gbc->memory[0xFF00] & 0x10) == 0) {
-        result = (uint8_t)(result & 0xF0);
-        result |= gbc->joypad_buttons;
+    if ((select & 0x20) == 0) {
+        low &= gbc->joypad_buttons;
     }
-    return result;
+
+    return (uint8_t)(0xC0 | select | low);
 }
 
 void pyemu_gbc_refresh_joypad(pyemu_gbc_system* gbc, uint8_t previous_value) {
-    uint8_t current = pyemu_gbc_current_joypad_value(gbc);
-    uint8_t changed = (uint8_t)(previous_value ^ current);
-    uint8_t selected = (uint8_t)((gbc->memory[0xFF00] >> 4) & 0x03);
-    if (selected == 0 && (changed & 0x0F) != 0) {
-        pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_JOYPAD);
-    } else if (selected == 1 && (changed & 0x0F) != 0) {
+    uint8_t current_value = pyemu_gbc_current_joypad_value(gbc);
+    uint8_t falling_edges = (uint8_t)((previous_value ^ current_value) & previous_value & 0x0F);
+
+    gbc->memory[0xFF00] = current_value;
+    if (falling_edges != 0) {
         pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_JOYPAD);
     }
 }
 
 void pyemu_gbc_set_joypad_state(pyemu_system* system, uint8_t buttons, uint8_t directions) {
     pyemu_gbc_system* gbc = (pyemu_gbc_system*)system;
-    uint8_t prev_buttons = gbc->joypad_buttons;
-    uint8_t prev_directions = gbc->joypad_directions;
-    gbc->joypad_buttons = (uint8_t)((buttons & 0x0F) | 0xF0);
-    gbc->joypad_directions = (uint8_t)((directions & 0x0F) | 0xF0);
-    if (gbc->memory[0xFF00] != 0) {
-        uint8_t prev_joypad = pyemu_gbc_current_joypad_value(gbc);
-        gbc->joypad_buttons = prev_buttons;
-        gbc->joypad_directions = prev_directions;
-        uint8_t curr_joypad = pyemu_gbc_current_joypad_value(gbc);
-        if (prev_joypad != curr_joypad) {
-            pyemu_gbc_refresh_joypad(gbc, prev_joypad);
-        }
+    uint8_t previous_value;
+
+    if (gbc == NULL) {
+        return;
     }
-    gbc->joypad_buttons = (uint8_t)((buttons & 0x0F) | 0xF0);
-    gbc->joypad_directions = (uint8_t)((directions & 0x0F) | 0xF0);
+
+    previous_value = pyemu_gbc_current_joypad_value(gbc);
+    gbc->joypad_buttons = (uint8_t)(buttons & 0x0F);
+    gbc->joypad_directions = (uint8_t)(directions & 0x0F);
+    pyemu_gbc_refresh_joypad(gbc, previous_value);
 }
 
 void pyemu_gbc_set_bus_tracking(pyemu_system* system, int enabled) {
@@ -181,70 +194,156 @@ void pyemu_gbc_request_interrupt(pyemu_gbc_system* gbc, uint8_t mask) {
     gbc->memory[PYEMU_IO_IF] = (uint8_t)(gbc->memory[PYEMU_IO_IF] | mask);
 }
 
+static uint8_t pyemu_gbc_stat_irq_signal(uint8_t stat, uint8_t coincidence, uint8_t mode) {
+    if (coincidence && (stat & 0x40)) {
+        return 1;
+    }
+    if (mode == 0 && (stat & 0x08)) {
+        return 1;
+    }
+    if (mode == 1 && (stat & 0x10)) {
+        return 1;
+    }
+    if (mode == 2 && (stat & 0x20)) {
+        return 1;
+    }
+    return 0;
+}
+
 int pyemu_gbc_lcd_enabled(const pyemu_gbc_system* gbc) {
     return (gbc->memory[PYEMU_IO_LCDC] & 0x80) != 0;
 }
 
 uint8_t pyemu_gbc_pending_interrupts(const pyemu_gbc_system* gbc) {
-    return (uint8_t)(gbc->memory[PYEMU_IO_IF] & gbc->memory[PYEMU_IO_IE] & 0x1F);
+    uint8_t pending = (uint8_t)(gbc->memory[PYEMU_IO_IF] & gbc->memory[PYEMU_IO_IE] & 0x1F);
+    if (!pyemu_gbc_lcd_enabled(gbc)) {
+        pending = (uint8_t)(pending & (uint8_t)~(PYEMU_INTERRUPT_VBLANK | PYEMU_INTERRUPT_LCD));
+    }
+    return pending;
 }
 
 void pyemu_gbc_update_stat(pyemu_gbc_system* gbc) {
+    uint8_t stat = gbc->memory[PYEMU_IO_STAT];
     uint8_t ly = gbc->memory[PYEMU_IO_LY];
     uint8_t lyc = gbc->memory[PYEMU_IO_LYC];
-    int coincidence = (ly == lyc) ? 1 : 0;
-    gbc->stat_coincidence = (uint8_t)coincidence;
-    uint8_t stat = gbc->memory[PYEMU_IO_STAT];
-    uint8_t mode = (uint8_t)(stat & 0x03);
-    uint8_t enabled = (uint8_t)((stat >> 3) & 0x0F);
-    int trigger = 0;
-    if ((enabled & 0x04) != 0 && coincidence) {
-        trigger = 1;
+    uint8_t coincidence = (uint8_t)(ly == lyc ? 1 : 0);
+    uint8_t mode;
+    uint8_t stat_signal;
+
+    if (!pyemu_gbc_lcd_enabled(gbc)) {
+        stat = (uint8_t)((stat & (uint8_t)~0x07) | 0x00);
+        gbc->memory[PYEMU_IO_STAT] = stat;
+        gbc->stat_mode = 0;
+        gbc->stat_coincidence = 0;
+        gbc->stat_irq_line = 0;
+        return;
     }
-    if ((enabled & 0x08) != 0 && mode == 2) {
-        trigger = 1;
+
+    if (ly >= 144) {
+        mode = 1;
+    } else if (gbc->ppu_counter < 80U) {
+        mode = 2;
+    } else if (gbc->ppu_counter < 252U) {
+        mode = 3;
+    } else {
+        mode = 0;
     }
-    if ((enabled & 0x10) != 0 && mode == 1) {
-        trigger = 1;
-    }
-    if ((enabled & 0x20) != 0 && mode == 0) {
-        trigger = 1;
-    }
-    if (trigger && !gbc->stat_irq_line) {
+
+    stat = (uint8_t)((stat & (uint8_t)~0x07) | (coincidence ? 0x04 : 0x00) | mode);
+    gbc->memory[PYEMU_IO_STAT] = stat;
+
+    stat_signal = pyemu_gbc_stat_irq_signal(stat, coincidence, mode);
+    if (stat_signal && !gbc->stat_irq_line) {
         pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_LCD);
     }
-    gbc->stat_irq_line = (uint8_t)(trigger ? 1 : 0);
+
+    gbc->stat_mode = mode;
+    gbc->stat_coincidence = coincidence;
+    gbc->stat_irq_line = stat_signal;
 }
 
 int pyemu_gbc_cpu_can_access_vram(const pyemu_gbc_system* gbc) {
-    uint8_t mode = (uint8_t)(gbc->memory[PYEMU_IO_STAT] & 0x03);
-    return mode != 3;
+    uint8_t ly;
+
+    if (!pyemu_gbc_lcd_enabled(gbc)) {
+        return 1;
+    }
+
+    ly = gbc->memory[PYEMU_IO_LY];
+    if (ly >= PYEMU_GBC_HEIGHT) {
+        return 1;
+    }
+
+    return gbc->ppu_counter < 80U || gbc->ppu_counter >= 252U;
 }
 
 int pyemu_gbc_cpu_can_access_oam(const pyemu_gbc_system* gbc) {
-    uint8_t mode = (uint8_t)(gbc->memory[PYEMU_IO_STAT] & 0x03);
-    return mode != 3;
+    uint8_t ly;
+
+    if (!pyemu_gbc_lcd_enabled(gbc)) {
+        return 1;
+    }
+
+    ly = gbc->memory[PYEMU_IO_LY];
+    if (ly >= PYEMU_GBC_HEIGHT) {
+        return 1;
+    }
+
+    return gbc->ppu_counter >= 252U;
+}
+
+static uint16_t pyemu_gbc_timer_bit_mask_from_tac(uint8_t tac) {
+    switch (tac & 0x03) {
+        case 0x00:
+            return 1U << 9;
+        case 0x01:
+            return 1U << 3;
+        case 0x02:
+            return 1U << 5;
+        default:
+            return 1U << 7;
+    }
+}
+
+static int pyemu_gbc_timer_signal_from_state(uint32_t div_counter, uint8_t tac) {
+    uint16_t mask;
+    if ((tac & 0x04) == 0) {
+        return 0;
+    }
+    mask = pyemu_gbc_timer_bit_mask_from_tac(tac);
+    return (div_counter & mask) != 0;
 }
 
 int pyemu_gbc_timer_signal(const pyemu_gbc_system* gbc) {
-    static const int divisors[] = {1024, 16, 64, 256};
-    uint8_t tac = gbc->memory[PYEMU_IO_TAC];
-    int index = (int)(tac & 0x03);
-    int enabled = (tac & 0x04) != 0;
-    return enabled ? 1 : 0;
+    return pyemu_gbc_timer_signal_from_state(gbc->div_counter, gbc->memory[PYEMU_IO_TAC]);
+}
+
+static void pyemu_gbc_increment_tima(pyemu_gbc_system* gbc) {
+    uint8_t tima = gbc->memory[PYEMU_IO_TIMA];
+    if (tima == 0xFF) {
+        gbc->memory[PYEMU_IO_TIMA] = gbc->memory[PYEMU_IO_TMA];
+        pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_TIMER);
+    } else {
+        gbc->memory[PYEMU_IO_TIMA] = (uint8_t)(tima + 1);
+    }
 }
 
 void pyemu_gbc_apply_timer_edge(pyemu_gbc_system* gbc, int old_signal, int new_signal) {
-    (void)gbc;
-    (void)old_signal;
-    (void)new_signal;
+    if (old_signal && !new_signal) {
+        pyemu_gbc_increment_tima(gbc);
+    }
 }
 
-static uint16_t pyemu_gbc_rgb15_to_rgb888(uint16_t color15) {
-    uint8_t r = (uint8_t)(((color15 >> 0) & 0x1F) * 255 / 31);
-    uint8_t g = (uint8_t)(((color15 >> 5) & 0x1F) * 255 / 31);
-    uint8_t b = (uint8_t)(((color15 >> 10) & 0x1F) * 255 / 31);
-    return (uint16_t)((r << 16) | (g << 8) | b);
+static uint32_t pyemu_gbc_rgb15_to_rgba8888(uint16_t color15) {
+    uint8_t r5 = (uint8_t)((color15 >> 0) & 0x1F);
+    uint8_t g5 = (uint8_t)((color15 >> 5) & 0x1F);
+    uint8_t b5 = (uint8_t)((color15 >> 10) & 0x1F);
+    /* Bit-replication (shift + OR) for accurate 5->8 bit expansion */
+    uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
+    uint8_t g = (uint8_t)((g5 << 3) | (g5 >> 2));
+    uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+    return (uint32_t)((r << 24) | (g << 16) | (b << 8) | 0xFF);
 }
 
 static uint32_t pyemu_gbc_get_bg_color(const pyemu_gbc_system* gbc, uint8_t palette_idx, uint8_t color_id) {
@@ -254,13 +353,7 @@ static uint32_t pyemu_gbc_get_bg_color(const pyemu_gbc_system* gbc, uint8_t pale
     uint8_t color_lsb = gbc->bg_palettes[palette_idx].data[color_id * 2];
     uint8_t color_msb = gbc->bg_palettes[palette_idx].data[color_id * 2 + 1];
     uint16_t rgb15 = (uint16_t)(color_msb << 8) | color_lsb;
-    if (rgb15 == 0) {
-        return 0x000000FF;
-    }
-    uint8_t r = (uint8_t)(((rgb15 >> 0) & 0x1F) * 255 / 31);
-    uint8_t g = (uint8_t)(((rgb15 >> 5) & 0x1F) * 255 / 31);
-    uint8_t b = (uint8_t)(((rgb15 >> 10) & 0x1F) * 255 / 31);
-    return (uint32_t)((r << 24) | (g << 16) | (b << 8) | 0xFF);
+    return pyemu_gbc_rgb15_to_rgba8888(rgb15);
 }
 
 static uint32_t pyemu_gbc_get_sp_color(const pyemu_gbc_system* gbc, uint8_t palette_idx, uint8_t color_id) {
@@ -270,13 +363,7 @@ static uint32_t pyemu_gbc_get_sp_color(const pyemu_gbc_system* gbc, uint8_t pale
     uint8_t color_lsb = gbc->sp_palettes[palette_idx].data[color_id * 2];
     uint8_t color_msb = gbc->sp_palettes[palette_idx].data[color_id * 2 + 1];
     uint16_t rgb15 = (uint16_t)(color_msb << 8) | color_lsb;
-    if (rgb15 == 0) {
-        return 0x000000FF;
-    }
-    uint8_t r = (uint8_t)(((rgb15 >> 0) & 0x1F) * 255 / 31);
-    uint8_t g = (uint8_t)(((rgb15 >> 5) & 0x1F) * 255 / 31);
-    uint8_t b = (uint8_t)(((rgb15 >> 10) & 0x1F) * 255 / 31);
-    return (uint32_t)((r << 24) | (g << 16) | (b << 8) | 0xFF);
+    return pyemu_gbc_rgb15_to_rgba8888(rgb15);
 }
 
 static uint8_t pyemu_gbc_tile_pixel(const pyemu_gbc_system* gbc, uint16_t cpu_address, uint8_t bank, uint8_t pixel_x, uint8_t pixel_y, int x_flip, int y_flip) {
@@ -308,17 +395,34 @@ static uint8_t pyemu_gbc_tile_pixel(const pyemu_gbc_system* gbc, uint16_t cpu_ad
 
 static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
     int x;
-    uint8_t lcdc = gbc->memory[PYEMU_IO_LCDC];
-    uint8_t scy = gbc->memory[0xFF42];
-    uint8_t scx = gbc->memory[0xFF43];
-    uint8_t wy = gbc->memory[PYEMU_IO_WY];
-    uint8_t wx = gbc->memory[PYEMU_IO_WX];
+    uint8_t lcdc = gbc->line_lcdc[y];
+    uint8_t scy = gbc->line_scy[y];
+    uint8_t scx = gbc->line_scx[y];
+    uint8_t wy = gbc->line_wy[y];
+    uint8_t wx = gbc->line_wx[y];
+
+    /* Pre-collect up to 10 sprites visible on this scanline (GBC/DMG 10-sprite limit).
+       OAM order determines priority: lower index wins. */
+    int active_sprites[10];
+    int active_sprite_count = 0;
+    if (lcdc & 0x02) {
+        int sprite_height = (lcdc & 0x04) ? 16 : 8;
+        int si;
+        for (si = 0; si < 40 && active_sprite_count < 10; ++si) {
+            uint16_t oam = (uint16_t)(0xFE00 + si * 4);
+            int sprite_y = (int)gbc->memory[oam] - 16;
+            if ((int)y >= sprite_y && (int)y < sprite_y + sprite_height) {
+                active_sprites[active_sprite_count++] = si;
+            }
+        }
+    }
 
     for (x = 0; x < 160; ++x) {
         size_t pixel = (size_t)(y * 160 + x) * 4U;
         uint32_t color = 0xFF00FF00;
         uint8_t bg_color_id = 0;
         uint8_t bg_palette = 0;
+        uint8_t bg_tile_priority = 0;
 
         if (gbc->rom_loaded) {
             uint8_t map_x = (uint8_t)(x + scx);
@@ -330,6 +434,7 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
             uint8_t tile_attr = gbc->vram[tile_map_address - 0x8000 + 0x2000];
             uint8_t tile_bank = (uint8_t)((tile_attr & 0x08) ? 1 : 0);
             bg_palette = (uint8_t)(tile_attr & 0x07);
+            bg_tile_priority = (uint8_t)((tile_attr & 0x80) ? 1 : 0);
 
             uint16_t tile_address;
             if (lcdc & 0x10) {
@@ -351,7 +456,7 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
 
             if ((lcdc & 0x20) && y >= wy && (int)x >= ((int)wx - 7)) {
                 uint8_t win_x = (uint8_t)(x - ((int)wx - 7));
-                uint8_t win_y = (uint8_t)(y - wy);
+                uint8_t win_y = gbc->line_win_y[y];
                 uint16_t win_map_base = (lcdc & 0x40) ? 0x9C00 : 0x9800;
                 uint16_t win_tile_map_address = (uint16_t)(win_map_base + ((win_y / 8) * 32) + (win_x / 8));
                 uint8_t win_tile_index = gbc->memory[win_tile_map_address];
@@ -359,6 +464,7 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
                 uint8_t win_tile_attr = gbc->vram[win_tile_map_address - 0x8000 + 0x2000];
                 uint8_t win_tile_bank = (uint8_t)((win_tile_attr & 0x08) ? 1 : 0);
                 bg_palette = (uint8_t)(win_tile_attr & 0x07);
+                bg_tile_priority = (uint8_t)((win_tile_attr & 0x80) ? 1 : 0);
 
                 uint16_t win_tile_address;
                 if (lcdc & 0x10) {
@@ -384,8 +490,9 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
 
         if (lcdc & 0x02) {
             int sprite_height = (lcdc & 0x04) ? 16 : 8;
-            int sprite_index;
-            for (sprite_index = 0; sprite_index < 40; ++sprite_index) {
+            int ai;
+            for (ai = 0; ai < active_sprite_count; ++ai) {
+                int sprite_index = active_sprites[ai];
                 uint16_t oam = (uint16_t)(0xFE00 + sprite_index * 4);
                 int sprite_y = (int)gbc->memory[oam] - 16;
                 int sprite_x = (int)gbc->memory[(uint16_t)(oam + 1)] - 8;
@@ -395,7 +502,7 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
                 uint8_t sx, sy;
                 uint8_t sp_color_id;
 
-                if (x < sprite_x || x >= sprite_x + 8 || y < sprite_y || y >= sprite_y + sprite_height) {
+                if (x < sprite_x || x >= sprite_x + 8) {
                     continue;
                 }
 
@@ -416,12 +523,15 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
                     }
                 }
 
-                uint16_t sp_tile_address = (uint16_t)(0x8000 + (tile * 16) + (sy * 2));
+                uint16_t sp_tile_address = (uint16_t)(0x8000 + (tile * 16));
                 sp_color_id = pyemu_gbc_tile_pixel(gbc, sp_tile_address, (uint8_t)((sp_attr & 0x08) ? 1 : 0), sx, sy, 0, 0);
                 if (sp_color_id == 0) {
                     continue;
                 }
-                if ((sp_attr & 0x80) && bg_color_id != 0) {
+                /* CGB: LCDC bit 0 = master BG/Window priority.
+                   When bit 0 = 0, sprites always render over BG/Window
+                   regardless of tile priority or sprite OAM priority flag. */
+                if ((lcdc & 0x01) && bg_color_id != 0 && ((sp_attr & 0x80) || bg_tile_priority)) {
                     continue;
                 }
 
@@ -437,40 +547,172 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
     }
 }
 
+void pyemu_gbc_latch_scanline_registers(pyemu_gbc_system* gbc, uint8_t ly) {
+    uint8_t lcdc;
+    uint8_t wx;
+    uint8_t wy;
+    if (ly >= PYEMU_GBC_HEIGHT) {
+        return;
+    }
+    gbc->line_scx[ly]  = gbc->memory[0xFF43];
+    gbc->line_scy[ly]  = gbc->memory[0xFF42];
+    gbc->line_wx[ly]   = gbc->memory[PYEMU_IO_WX];
+    gbc->line_wy[ly]   = gbc->memory[PYEMU_IO_WY];
+    gbc->line_lcdc[ly] = gbc->memory[PYEMU_IO_LCDC];
+    gbc->line_bgp[ly]  = gbc->memory[PYEMU_IO_BGP];
+    gbc->line_obp0[ly] = gbc->memory[PYEMU_IO_OBP0];
+    gbc->line_obp1[ly] = gbc->memory[PYEMU_IO_OBP1];
+
+    /* Track window internal line counter.
+       The counter is stored BEFORE incrementing so the render uses it,
+       then we increment if this scanline actually draws any window pixels
+       (window enabled, y >= WY, and WX <= 166 so at least one pixel shows). */
+    lcdc = gbc->line_lcdc[ly];
+    wx   = gbc->line_wx[ly];
+    wy   = gbc->line_wy[ly];
+    gbc->line_win_y[ly] = gbc->window_line_counter;
+    if ((lcdc & 0x20) && ly >= wy && wx <= 166) {
+        gbc->window_line_counter = (uint8_t)(gbc->window_line_counter + 1);
+    }
+}
+
 void pyemu_gbc_update_demo_frame(pyemu_gbc_system* gbc) {
     int y;
+    gbc->window_line_counter = 0;
     for (y = 0; y < 144; ++y) {
+        pyemu_gbc_latch_scanline_registers(gbc, (uint8_t)y);
         pyemu_gbc_render_scanline(gbc, (uint8_t)y);
     }
 }
 
 void pyemu_gbc_tick(pyemu_gbc_system* gbc, int cycles) {
     int ticks = gbc->double_speed ? (cycles * 2) : cycles;
+    uint32_t old_div_counter = gbc->div_counter;
+    uint8_t tac = gbc->memory[PYEMU_IO_TAC];
+    int remaining_cycles = ticks;
+
     gbc->cycle_count += (uint64_t)ticks;
     gbc->div_counter += (uint32_t)ticks;
-    gbc->ppu_counter += (uint32_t)ticks;
-    gbc->timer_counter += (uint32_t)ticks;
-    if (gbc->timer_counter >= 256) {
-        gbc->timer_counter -= 256;
-        uint8_t tima = gbc->memory[PYEMU_IO_TIMA];
-        if (tima == 0xFF) {
-            gbc->memory[PYEMU_IO_TIMA] = gbc->memory[PYEMU_IO_TMA];
-            pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_TIMER);
+    gbc->memory[PYEMU_IO_DIV] = (uint8_t)((gbc->div_counter >> 8) & 0xFF);
+
+    /* Serial transfer: simulate a virtual link-cable partner.
+     * When SC bit 7 (transfer start) is set:
+     *   Internal clock (SC=0x81): complete after 4096 cycles.
+     *   External clock (SC=0x80): complete after 8192 cycles timeout.
+     * On completion: SB is set to the partner's reply byte, SC bit 7 clears,
+     * serial IRQ fires.
+     *
+     * Protocol-aware reply table (Tetris DX link handshake):
+     *   $DD -> $DD  (initial link detect handshake)
+     *   $F0 -> $F0  (1P lobby broadcast; game advances C0A8 3->4)
+     *   $FE -> $10  (C0A8=4 probe: reply $10 = 1-player confirmation)
+     *   $10 -> $10  (C0A8=4 D20C=0 re-dispatch; acknowledge 1P)
+     *   $0E -> $0E  (game-start signal)
+     *   $0F -> $0F  (game-start signal)
+     *   $FF -> $FF  (generic ack)
+     *   everything else -> echo (SB unchanged)
+     */
+    if (gbc->memory[0xFF02] & 0x80) {
+        uint32_t timeout = (gbc->memory[0xFF02] & 0x01) ? 4096u : 8192u;
+        if (gbc->serial_counter == 0) {
+            gbc->serial_counter = timeout;
+        }
+        if (gbc->serial_counter <= (uint32_t)ticks) {
+            gbc->serial_counter = 0;
+            /* Compute the partner's reply byte */
+            uint8_t sent = gbc->memory[0xFF01];
+            uint8_t reply;
+            switch (sent) {
+                case 0xFE: reply = 0x10; break; /* 1-player confirmation */
+                default:   reply = sent;  break; /* echo everything else */
+            }
+            gbc->memory[0xFF01] = reply;
+            gbc->memory[0xFF02] &= (uint8_t)~0x80; /* Clear SC bit 7: transfer complete */
+            pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_SERIAL);
         } else {
-            gbc->memory[PYEMU_IO_TIMA] = (uint8_t)(tima + 1);
+            gbc->serial_counter -= (uint32_t)ticks;
+        }
+    } else {
+        gbc->serial_counter = 0;
+    }
+
+    if (tac & 0x04) {
+        uint32_t mask = pyemu_gbc_timer_bit_mask_from_tac(tac);
+        uint32_t period = mask << 1;
+        uint32_t old_edges = old_div_counter / period;
+        uint32_t new_edges = gbc->div_counter / period;
+        uint32_t edge_count = new_edges - old_edges;
+        while (edge_count > 0) {
+            pyemu_gbc_increment_tima(gbc);
+            edge_count -= 1;
         }
     }
-    if (gbc->ppu_counter >= PYEMU_GBC_CYCLES_PER_SCANLINE) {
-        gbc->ppu_counter -= PYEMU_GBC_CYCLES_PER_SCANLINE;
-        uint8_t ly = gbc->memory[PYEMU_IO_LY];
-        if (ly < 153) {
-            gbc->memory[PYEMU_IO_LY] = (uint8_t)(ly + 1);
-        } else {
-            gbc->memory[PYEMU_IO_LY] = 0;
-        }
+
+    if (!pyemu_gbc_lcd_enabled(gbc)) {
+        gbc->ppu_counter = 0;
+        gbc->memory[PYEMU_IO_LY] = 0;
         pyemu_gbc_update_stat(gbc);
-        if (ly == 143) {
-            pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_VBLANK);
+        return;
+    }
+
+    while (remaining_cycles > 0) {
+        int step_cycles = remaining_cycles;
+        uint32_t old_ppu_counter = gbc->ppu_counter;
+        int until_scanline_end = (int)(PYEMU_GBC_CYCLES_PER_SCANLINE - gbc->ppu_counter);
+        int next_mode_boundary = until_scanline_end;
+        int stat_needs_update = 0;
+
+        if (gbc->memory[PYEMU_IO_LY] < 144) {
+            if (gbc->ppu_counter < 80U) {
+                next_mode_boundary = (int)(80U - gbc->ppu_counter);
+            } else if (gbc->ppu_counter < 252U) {
+                next_mode_boundary = (int)(252U - gbc->ppu_counter);
+            }
+        }
+
+        if (next_mode_boundary <= 0) {
+            next_mode_boundary = until_scanline_end > 0 ? until_scanline_end : 1;
+        }
+        if (step_cycles > next_mode_boundary) {
+            step_cycles = next_mode_boundary;
+        }
+
+        gbc->ppu_counter += (uint32_t)step_cycles;
+        remaining_cycles -= step_cycles;
+
+        if (gbc->memory[PYEMU_IO_LY] < 144) {
+            if (old_ppu_counter < 80U && gbc->ppu_counter >= 80U) {
+                stat_needs_update = 1;
+            } else if (old_ppu_counter < 252U && gbc->ppu_counter >= 252U) {
+                stat_needs_update = 1;
+            }
+        }
+
+        while (gbc->ppu_counter >= PYEMU_GBC_CYCLES_PER_SCANLINE) {
+            uint8_t current_ly = gbc->memory[PYEMU_IO_LY];
+            gbc->ppu_counter -= PYEMU_GBC_CYCLES_PER_SCANLINE;
+            if (current_ly < 144) {
+                pyemu_gbc_render_scanline(gbc, current_ly);
+            }
+            gbc->memory[PYEMU_IO_LY] = (uint8_t)(current_ly + 1);
+            if (gbc->memory[PYEMU_IO_LY] == 144) {
+                pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_VBLANK);
+            } else if (gbc->memory[PYEMU_IO_LY] > 153) {
+                gbc->memory[PYEMU_IO_LY] = 0;
+                gbc->window_line_counter = 0;
+            }
+
+            {
+                uint8_t ly = gbc->memory[PYEMU_IO_LY];
+                if (ly < PYEMU_GBC_HEIGHT) {
+                    pyemu_gbc_latch_scanline_registers(gbc, ly);
+                }
+            }
+            stat_needs_update = 1;
+        }
+
+        if (stat_needs_update) {
+            pyemu_gbc_update_stat(gbc);
         }
     }
 }

@@ -10,6 +10,30 @@ static uint8_t pyemu_gbc_normalize_wram_bank(uint8_t value) {
     return bank == 0 ? 1 : bank;
 }
 
+static void pyemu_gbc_run_hdma(pyemu_gbc_system* gbc, uint8_t value) {
+    uint16_t source = (uint16_t)(((uint16_t)gbc->memory[PYEMU_GBC_HDMA1] << 8) | (gbc->memory[PYEMU_GBC_HDMA2] & 0xF0));
+    uint16_t dest = (uint16_t)(0x8000 | (((uint16_t)gbc->memory[PYEMU_GBC_HDMA3] & 0x1F) << 8) | (gbc->memory[PYEMU_GBC_HDMA4] & 0xF0));
+    uint16_t length = (uint16_t)((((value & 0x7F) + 1) & 0x7F) * 0x10);
+    uint16_t index;
+
+    for (index = 0; index < length; ++index) {
+        uint16_t dst = (uint16_t)(dest + index);
+        uint8_t copied = pyemu_gbc_peek_memory(gbc, (uint16_t)(source + index));
+        if (dst >= 0x8000 && dst <= 0x9FFF) {
+            gbc->vram[(dst - 0x8000) + (gbc->current_vbk * 0x2000)] = copied;
+            gbc->memory[dst] = copied;
+        }
+    }
+
+    source = (uint16_t)(source + length);
+    dest = (uint16_t)(dest + length);
+    gbc->memory[PYEMU_GBC_HDMA1] = (uint8_t)(source >> 8);
+    gbc->memory[PYEMU_GBC_HDMA2] = (uint8_t)(source & 0xF0);
+    gbc->memory[PYEMU_GBC_HDMA3] = (uint8_t)((dest >> 8) & 0x1F);
+    gbc->memory[PYEMU_GBC_HDMA4] = (uint8_t)(dest & 0xF0);
+    gbc->memory[PYEMU_GBC_HDMA5] = 0xFF;
+}
+
 static uint8_t pyemu_gbc_wram_value(const pyemu_gbc_system* gbc, uint16_t address) {
     if (address >= 0xC000 && address <= 0xCFFF) {
         return gbc->wram[address - 0xC000];
@@ -85,9 +109,38 @@ uint8_t pyemu_gbc_peek_memory(const pyemu_gbc_system* gbc, uint16_t address) {
     if (address == 0xFF00) {
         return pyemu_gbc_current_joypad_value(gbc);
     }
+    if (address == PYEMU_GBC_BG_PALETTE_INDEX) {
+        return gbc->bg_palette_index;
+    }
+    if (address == PYEMU_GBC_BG_PALETTE_DATA) {
+        uint8_t palette_offset = (uint8_t)(gbc->bg_palette_index & 0x3F);
+        uint8_t palette_idx = (uint8_t)(palette_offset >> 3);
+        uint8_t byte_idx = (uint8_t)(palette_offset & 0x07);
+        return palette_idx < 8 ? gbc->bg_palettes[palette_idx].data[byte_idx] : 0xFF;
+    }
+    if (address == PYEMU_GBC_SPRITE_PALETTE_INDEX) {
+        return gbc->sp_palette_index;
+    }
+    if (address == PYEMU_GBC_SPRITE_PALETTE_DATA) {
+        uint8_t palette_offset = (uint8_t)(gbc->sp_palette_index & 0x3F);
+        uint8_t palette_idx = (uint8_t)(palette_offset >> 3);
+        uint8_t byte_idx = (uint8_t)(palette_offset & 0x07);
+        return palette_idx < 8 ? gbc->sp_palettes[palette_idx].data[byte_idx] : 0xFF;
+    }
     if (address >= 0xA000 && address <= 0xBFFF) {
         if (!gbc->ram_enabled || !pyemu_gbc_has_external_ram(gbc)) {
             return 0xFF;
+        }
+        /* MBC3 RTC register read */
+        if (pyemu_gbc_uses_mbc3(gbc) && gbc->mbc3_ram_bank >= 0x08 && gbc->mbc3_ram_bank <= 0x0C) {
+            switch (gbc->mbc3_ram_bank) {
+                case 0x08: return gbc->rtc_latch_s;
+                case 0x09: return gbc->rtc_latch_m;
+                case 0x0A: return gbc->rtc_latch_h;
+                case 0x0B: return gbc->rtc_latch_dl;
+                case 0x0C: return gbc->rtc_latch_dh;
+                default:   return 0xFF;
+            }
         }
         size_t offset = pyemu_gbc_current_eram_offset(gbc) + (size_t)(address - 0xA000);
         return offset < gbc->eram_size ? gbc->eram[offset] : 0xFF;
@@ -123,10 +176,10 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
     if (address < 0x8000) {
         pyemu_gbc_record_access(gbc, address, value, 1);
         if (address <= 0x1FFF) {
-            if (pyemu_gbc_uses_mbc1(gbc) || pyemu_gbc_uses_mbc3(gbc)) {
+            if (pyemu_gbc_uses_mbc1(gbc) || pyemu_gbc_uses_mbc3(gbc) || pyemu_gbc_uses_mbc5(gbc)) {
                 gbc->ram_enabled = ((value & 0x0F) == 0x0A) ? 1 : 0;
             }
-        } else if (address <= 0x3FFF) {
+        } else if (address <= 0x2FFF) {
             if (pyemu_gbc_uses_mbc1(gbc)) {
                 gbc->mbc1_rom_bank = pyemu_gbc_normalize_mbc1_bank(gbc, value);
             } else if (pyemu_gbc_uses_mbc3(gbc)) {
@@ -134,10 +187,19 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
                 if (gbc->mbc3_rom_bank == 0) {
                     gbc->mbc3_rom_bank = 1;
                 }
+            } else if (pyemu_gbc_uses_mbc5(gbc)) {
+                gbc->mbc3_rom_bank = value;
             }
             pyemu_gbc_refresh_rom_mapping(gbc);
             memcpy(gbc->memory + 0x0000, gbc->rom_bank0, sizeof(gbc->rom_bank0));
             memcpy(gbc->memory + 0x4000, gbc->rom_bankx, sizeof(gbc->rom_bankx));
+        } else if (address <= 0x3FFF) {
+            if (pyemu_gbc_uses_mbc5(gbc)) {
+                gbc->mbc3_ram_bank = (uint8_t)(value & 0x01);
+                pyemu_gbc_refresh_rom_mapping(gbc);
+                memcpy(gbc->memory + 0x0000, gbc->rom_bank0, sizeof(gbc->rom_bank0));
+                memcpy(gbc->memory + 0x4000, gbc->rom_bankx, sizeof(gbc->rom_bankx));
+            }
         } else if (address <= 0x5FFF) {
             if (pyemu_gbc_uses_mbc1(gbc)) {
                 gbc->mbc3_ram_bank = (uint8_t)(value & 0x03);
@@ -145,9 +207,22 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
                 memcpy(gbc->memory + 0x0000, gbc->rom_bank0, sizeof(gbc->rom_bank0));
                 memcpy(gbc->memory + 0x4000, gbc->rom_bankx, sizeof(gbc->rom_bankx));
                 pyemu_gbc_refresh_eram_window(gbc);
-            } else if (pyemu_gbc_uses_mbc3(gbc) && gbc->eram_bank_count > 0) {
-                gbc->mbc3_ram_bank = (uint8_t)(value & 0x03);
-                pyemu_gbc_refresh_eram_window(gbc);
+            } else if (pyemu_gbc_uses_mbc3(gbc)) {
+                if (value <= 0x03) {
+                    /* RAM bank select (0-3) */
+                    if (gbc->eram_bank_count > 0) {
+                        gbc->mbc3_ram_bank = (uint8_t)(value & 0x03);
+                        pyemu_gbc_refresh_eram_window(gbc);
+                    }
+                } else if (value >= 0x08 && value <= 0x0C) {
+                    /* RTC register select */
+                    gbc->mbc3_ram_bank = value;
+                }
+            } else if (pyemu_gbc_uses_mbc5(gbc)) {
+                if (gbc->eram_bank_count > 0) {
+                    gbc->mbc3_ram_bank = (uint8_t)(value & 0x0F);
+                    pyemu_gbc_refresh_eram_window(gbc);
+                }
             }
         } else if (address <= 0x7FFF) {
             if (pyemu_gbc_uses_mbc1(gbc)) {
@@ -156,6 +231,18 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
                 memcpy(gbc->memory + 0x0000, gbc->rom_bank0, sizeof(gbc->rom_bank0));
                 memcpy(gbc->memory + 0x4000, gbc->rom_bankx, sizeof(gbc->rom_bankx));
                 pyemu_gbc_refresh_eram_window(gbc);
+            } else if (pyemu_gbc_uses_mbc3(gbc)) {
+                /* RTC latch: write 0x00 then 0x01 to copy live RTC into latched regs */
+                if (value == 0x00) {
+                    gbc->rtc_latch_ready = 1;
+                } else if (value == 0x01 && gbc->rtc_latch_ready) {
+                    gbc->rtc_latch_s  = gbc->rtc_s;
+                    gbc->rtc_latch_m  = gbc->rtc_m;
+                    gbc->rtc_latch_h  = gbc->rtc_h;
+                    gbc->rtc_latch_dl = gbc->rtc_dl;
+                    gbc->rtc_latch_dh = gbc->rtc_dh;
+                    gbc->rtc_latch_ready = 0;
+                }
             }
         }
         return;
@@ -182,11 +269,22 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
 
     if (address >= 0xA000 && address <= 0xBFFF) {
         if (gbc->ram_enabled && pyemu_gbc_has_external_ram(gbc)) {
-            size_t offset = pyemu_gbc_current_eram_offset(gbc) + (size_t)(address - 0xA000);
-            if (offset < gbc->eram_size) {
-                gbc->eram[offset] = value;
-                gbc->memory[address] = value;
-                gbc->battery_dirty = 1;
+            /* MBC3 RTC register write */
+            if (pyemu_gbc_uses_mbc3(gbc) && gbc->mbc3_ram_bank >= 0x08 && gbc->mbc3_ram_bank <= 0x0C) {
+                switch (gbc->mbc3_ram_bank) {
+                    case 0x08: gbc->rtc_s  = (uint8_t)(value & 0x3F); break;
+                    case 0x09: gbc->rtc_m  = (uint8_t)(value & 0x3F); break;
+                    case 0x0A: gbc->rtc_h  = (uint8_t)(value & 0x1F); break;
+                    case 0x0B: gbc->rtc_dl = value; break;
+                    case 0x0C: gbc->rtc_dh = (uint8_t)(value & 0xC1); break;
+                }
+            } else {
+                size_t offset = pyemu_gbc_current_eram_offset(gbc) + (size_t)(address - 0xA000);
+                if (offset < gbc->eram_size) {
+                    gbc->eram[offset] = value;
+                    gbc->memory[address] = value;
+                    gbc->battery_dirty = 1;
+                }
             }
         }
         pyemu_gbc_record_access(gbc, address, value, 1);
@@ -201,8 +299,10 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
         return;
     }
     if (address == PYEMU_GBC_SPEED) {
-        gbc->memory[address] = (uint8_t)(value & 0x01);
-        gbc->double_speed = (value & 0x01) != 0;
+        /* Bit 0 = prepare-speed-switch arm bit; bit 7 (read-only) = current speed.
+           Writing only latches the arm bit; the actual switch happens on STOP. */
+        uint8_t current_speed_bit = (uint8_t)(gbc->double_speed ? 0x80 : 0x00);
+        gbc->memory[address] = (uint8_t)(current_speed_bit | (value & 0x01));
         pyemu_gbc_record_access(gbc, address, value, 1);
         return;
     }
@@ -217,6 +317,31 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
         gbc->current_wram_bank = pyemu_gbc_normalize_wram_bank(value);
         gbc->memory[address] = (uint8_t)(0xF8 | gbc->current_wram_bank);
         pyemu_gbc_sync_memory(gbc);
+        pyemu_gbc_record_access(gbc, address, gbc->memory[address], 1);
+        return;
+    }
+    if (address == PYEMU_GBC_HDMA1) {
+        gbc->memory[address] = value;
+        pyemu_gbc_record_access(gbc, address, value, 1);
+        return;
+    }
+    if (address == PYEMU_GBC_HDMA2) {
+        gbc->memory[address] = (uint8_t)(value & 0xF0);
+        pyemu_gbc_record_access(gbc, address, gbc->memory[address], 1);
+        return;
+    }
+    if (address == PYEMU_GBC_HDMA3) {
+        gbc->memory[address] = (uint8_t)(value & 0x1F);
+        pyemu_gbc_record_access(gbc, address, gbc->memory[address], 1);
+        return;
+    }
+    if (address == PYEMU_GBC_HDMA4) {
+        gbc->memory[address] = (uint8_t)(value & 0xF0);
+        pyemu_gbc_record_access(gbc, address, gbc->memory[address], 1);
+        return;
+    }
+    if (address == PYEMU_GBC_HDMA5) {
+        pyemu_gbc_run_hdma(gbc, value);
         pyemu_gbc_record_access(gbc, address, gbc->memory[address], 1);
         return;
     }
@@ -309,7 +434,6 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
         if ((previous & 0x80) && !(value & 0x80)) {
             gbc->ppu_counter = 0;
             gbc->memory[PYEMU_IO_LY] = 0;
-            gbc->memory[PYEMU_IO_IF] = (uint8_t)(0xE0 | ((gbc->memory[PYEMU_IO_IF] & (uint8_t)~(PYEMU_INTERRUPT_VBLANK | PYEMU_INTERRUPT_LCD)) & 0x1F));
             gbc->stat_irq_line = 0;
             gbc->stat_mode = 0;
             gbc->stat_coincidence = 0;
@@ -338,6 +462,10 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
 
     gbc->memory[address] = value;
     pyemu_gbc_record_access(gbc, address, value, 1);
+
+    if (address >= 0xFF10 && address <= 0xFF26) {
+        pyemu_gbc_apu_handle_write(gbc, address, value);
+    }
 
     if (address >= 0xC000 && address <= 0xCFFF) {
         size_t offset = (size_t)(address - 0xC000);
@@ -405,10 +533,16 @@ static void pyemu_gbc_extract_title(pyemu_gbc_system* gbc) {
 }
 
 static void pyemu_gbc_set_post_boot_state(pyemu_gbc_system* gbc) {
-    pyemu_gbc_set_af(gbc, 0x01B0);
-    pyemu_gbc_set_bc(gbc, 0x0013);
-    pyemu_gbc_set_de(gbc, 0x00D8);
-    pyemu_gbc_set_hl(gbc, 0x014D);
+    /* On real CGB hardware the boot ROM sets A=0x11 before handing off to the
+     * cartridge. Games use this to detect GBC mode and enable color features.
+     * If the cartridge header at 0x0143 has the CGB flag (0x80 or 0xC0), set
+     * A=0x11 so the game takes the CGB code path instead of the DMG/SGB path. */
+    uint8_t cgb_flag = gbc->rom_bank0[0x0143];
+    int is_cgb = (cgb_flag == 0x80 || cgb_flag == 0xC0);
+    pyemu_gbc_set_af(gbc, is_cgb ? 0x11B0 : 0x01B0);
+    pyemu_gbc_set_bc(gbc, is_cgb ? 0x0000 : 0x0013);
+    pyemu_gbc_set_de(gbc, is_cgb ? 0xFF56 : 0x00D8);
+    pyemu_gbc_set_hl(gbc, is_cgb ? 0x000D : 0x014D);
     gbc->cpu.sp = 0xFFFE;
     gbc->cpu.pc = 0x0100;
     gbc->cpu.halted = 0;
@@ -436,6 +570,8 @@ static void pyemu_gbc_set_post_boot_state(pyemu_gbc_system* gbc) {
     pyemu_gbc_write_memory(gbc, PYEMU_IO_TMA, 0x00);
     pyemu_gbc_write_memory(gbc, PYEMU_IO_TAC, 0x00);
     pyemu_gbc_write_memory(gbc, PYEMU_IO_IF, 0xE1);
+    pyemu_gbc_write_memory(gbc, 0xFF01, 0x00);  /* SB: Serial data = 0 */
+    pyemu_gbc_write_memory(gbc, 0xFF02, 0x7E);  /* SC: Serial control = idle (no transfer, external clock) */
     pyemu_gbc_write_memory(gbc, PYEMU_GBC_SPEED, 0x7E);
     pyemu_gbc_write_memory(gbc, PYEMU_GBC_VBK, 0xFE);
     pyemu_gbc_write_memory(gbc, PYEMU_GBC_SVBK, 0xF9);
@@ -497,6 +633,8 @@ static void pyemu_gbc_reset(pyemu_system* system) {
     memset(gbc->line_bgp, 0, sizeof(gbc->line_bgp));
     memset(gbc->line_obp0, 0, sizeof(gbc->line_obp0));
     memset(gbc->line_obp1, 0, sizeof(gbc->line_obp1));
+    memset(gbc->line_win_y, 0, sizeof(gbc->line_win_y));
+    gbc->window_line_counter = 0;
     memset(gbc->block_cache, 0, sizeof(gbc->block_cache));
     memset(gbc->bg_palettes, 0, sizeof(gbc->bg_palettes));
     memset(gbc->sp_palettes, 0, sizeof(gbc->sp_palettes));
@@ -530,6 +668,13 @@ static void pyemu_gbc_reset(pyemu_system* system) {
         gbc->mbc3_rom_bank = pyemu_gbc_uses_mbc1(gbc) ? 0 : 1;
         gbc->mbc3_ram_bank = 0;
     }
+
+    /* Zero RTC state on every reset */
+    gbc->rtc_s = 0; gbc->rtc_m = 0; gbc->rtc_h = 0; gbc->rtc_dl = 0; gbc->rtc_dh = 0;
+    gbc->rtc_latch_s = 0; gbc->rtc_latch_m = 0; gbc->rtc_latch_h = 0;
+    gbc->rtc_latch_dl = 0; gbc->rtc_latch_dh = 0;
+    gbc->rtc_latch_ready = 0;
+    gbc->rtc_cycle_accum = 0;
 
     pyemu_gbc_sync_memory(gbc);
     pyemu_gbc_set_post_boot_state(gbc);
@@ -628,6 +773,8 @@ static int pyemu_gbc_save_state(const pyemu_system* system, const char* path) {
     memcpy(snapshot.line_bgp, gbc->line_bgp, sizeof(snapshot.line_bgp));
     memcpy(snapshot.line_obp0, gbc->line_obp0, sizeof(snapshot.line_obp0));
     memcpy(snapshot.line_obp1, gbc->line_obp1, sizeof(snapshot.line_obp1));
+    memcpy(snapshot.line_win_y, gbc->line_win_y, sizeof(snapshot.line_win_y));
+    snapshot.window_line_counter = gbc->window_line_counter;
     memcpy(snapshot.bg_palettes, gbc->bg_palettes, sizeof(snapshot.bg_palettes));
     memcpy(snapshot.sp_palettes, gbc->sp_palettes, sizeof(snapshot.sp_palettes));
     snapshot.current_vbk = gbc->current_vbk;
@@ -658,6 +805,19 @@ static int pyemu_gbc_save_state(const pyemu_system* system, const char* path) {
     snapshot.last_access = gbc->last_access;
     snapshot.double_speed = gbc->double_speed;
     snapshot.faulted = gbc->faulted;
+    snapshot.serial_counter = gbc->serial_counter;
+    snapshot.rtc_s = gbc->rtc_s;
+    snapshot.rtc_m = gbc->rtc_m;
+    snapshot.rtc_h = gbc->rtc_h;
+    snapshot.rtc_dl = gbc->rtc_dl;
+    snapshot.rtc_dh = gbc->rtc_dh;
+    snapshot.rtc_latch_s = gbc->rtc_latch_s;
+    snapshot.rtc_latch_m = gbc->rtc_latch_m;
+    snapshot.rtc_latch_h = gbc->rtc_latch_h;
+    snapshot.rtc_latch_dl = gbc->rtc_latch_dl;
+    snapshot.rtc_latch_dh = gbc->rtc_latch_dh;
+    snapshot.rtc_latch_ready = gbc->rtc_latch_ready;
+    snapshot.rtc_cycle_accum = gbc->rtc_cycle_accum;
 
     state_file = fopen(path, "wb");
     if (state_file == NULL) {
@@ -711,6 +871,8 @@ static int pyemu_gbc_load_state(pyemu_system* system, const char* path) {
     memcpy(gbc->line_bgp, snapshot.line_bgp, sizeof(snapshot.line_bgp));
     memcpy(gbc->line_obp0, snapshot.line_obp0, sizeof(gbc->line_obp0));
     memcpy(gbc->line_obp1, snapshot.line_obp1, sizeof(gbc->line_obp1));
+    memcpy(gbc->line_win_y, snapshot.line_win_y, sizeof(gbc->line_win_y));
+    gbc->window_line_counter = snapshot.window_line_counter;
     memcpy(gbc->bg_palettes, snapshot.bg_palettes, sizeof(gbc->bg_palettes));
     memcpy(gbc->sp_palettes, snapshot.sp_palettes, sizeof(gbc->sp_palettes));
     gbc->current_vbk = snapshot.current_vbk;
@@ -744,9 +906,21 @@ static int pyemu_gbc_load_state(pyemu_system* system, const char* path) {
     memset(&gbc->last_mapper_access, 0, sizeof(gbc->last_mapper_access));
     gbc->double_speed = snapshot.double_speed;
     gbc->faulted = snapshot.faulted;
+    gbc->serial_counter = snapshot.serial_counter;
+    gbc->rtc_s = snapshot.rtc_s;
+    gbc->rtc_m = snapshot.rtc_m;
+    gbc->rtc_h = snapshot.rtc_h;
+    gbc->rtc_dl = snapshot.rtc_dl;
+    gbc->rtc_dh = snapshot.rtc_dh;
+    gbc->rtc_latch_s = snapshot.rtc_latch_s;
+    gbc->rtc_latch_m = snapshot.rtc_latch_m;
+    gbc->rtc_latch_h = snapshot.rtc_latch_h;
+    gbc->rtc_latch_dl = snapshot.rtc_latch_dl;
+    gbc->rtc_latch_dh = snapshot.rtc_latch_dh;
+    gbc->rtc_latch_ready = snapshot.rtc_latch_ready;
+    gbc->rtc_cycle_accum = snapshot.rtc_cycle_accum;
 
     pyemu_gbc_refresh_rom_mapping(gbc);
-    pyemu_gbc_update_stat(gbc);
     pyemu_gbc_update_demo_frame(gbc);
     return 1;
 }
@@ -780,6 +954,21 @@ static int pyemu_gbc_execute_opcode(pyemu_gbc_system* gbc, uint8_t opcode) {
         case 0x00:
             cycles = 4;
             break;
+        case 0x10: {
+            /* STOP: on CGB, if KEY1 bit 0 is set (speed switch armed), toggle
+               double-speed mode and clear the arm bit, then resume execution.
+               Otherwise treat as a low-power halt (same as HALT for emulation). */
+            uint8_t key1 = gbc->memory[PYEMU_GBC_SPEED];
+            pyemu_gbc_fetch_u8(gbc); /* consume the mandatory 0x00 operand byte */
+            if (key1 & 0x01) {
+                gbc->double_speed = !gbc->double_speed;
+                gbc->memory[PYEMU_GBC_SPEED] = (uint8_t)(gbc->double_speed ? 0x80 : 0x00);
+            } else {
+                gbc->cpu.halted = 1;
+            }
+            cycles = 4;
+            break;
+        }
         case 0x76: {
             uint8_t pending_interrupts = pyemu_gbc_pending_interrupts(gbc);
             if (!gbc->ime && pending_interrupts != 0) {
@@ -1234,7 +1423,8 @@ static void pyemu_gbc_step_instruction(pyemu_system* system) {
 
 static void pyemu_gbc_step_frame(pyemu_system* system) {
     pyemu_gbc_system* gbc = (pyemu_gbc_system*)system;
-    uint64_t target_cycles = gbc->cycle_count + PYEMU_GBC_CYCLES_PER_FRAME;
+    uint64_t cycles_per_frame = gbc->double_speed ? (PYEMU_GBC_CYCLES_PER_FRAME * 2) : PYEMU_GBC_CYCLES_PER_FRAME;
+    uint64_t target_cycles = gbc->cycle_count + cycles_per_frame;
 
     while (gbc->cycle_count < target_cycles) {
         uint8_t enabled_interrupts = (uint8_t)(gbc->memory[PYEMU_IO_IE] & 0x1F);
@@ -1261,8 +1451,32 @@ static void pyemu_gbc_step_frame(pyemu_system* system) {
             break;
         }
     }
+    pyemu_gbc_update_audio_frame(gbc);
 
-    pyemu_gbc_update_demo_frame(gbc);
+    /* MBC3 RTC: advance by one frame's worth of cycles when not halted */
+    if (pyemu_gbc_uses_mbc3(gbc) && !(gbc->rtc_dh & 0x40)) {
+        gbc->rtc_cycle_accum += PYEMU_GBC_CYCLES_PER_FRAME;
+        while (gbc->rtc_cycle_accum >= 4194304U) {
+            gbc->rtc_cycle_accum -= 4194304U;
+            gbc->rtc_s++;
+            if (gbc->rtc_s >= 60) { gbc->rtc_s = 0; gbc->rtc_m++; }
+            if (gbc->rtc_m >= 60) { gbc->rtc_m = 0; gbc->rtc_h++; }
+            if (gbc->rtc_h >= 24) {
+                gbc->rtc_h = 0;
+                {
+                    uint16_t days = (uint16_t)(gbc->rtc_dl | ((gbc->rtc_dh & 0x01) << 8));
+                    days++;
+                    gbc->rtc_dl = (uint8_t)(days & 0xFF);
+                    gbc->rtc_dh = (uint8_t)((gbc->rtc_dh & 0xFE) | ((days >> 8) & 0x01));
+                    if (days >= 512) {
+                        gbc->rtc_dh |= 0x80; /* day carry */
+                        gbc->rtc_dl = 0;
+                        gbc->rtc_dh &= ~0x01;
+                    }
+                }
+            }
+        }
+    }
 }
 
 static void pyemu_gbc_destroy(pyemu_system* system) {
@@ -1296,10 +1510,13 @@ static void pyemu_gbc_get_frame_buffer(const pyemu_system* system, pyemu_frame_b
 }
 
 static const uint8_t* pyemu_gbc_get_memory(const pyemu_system* system, size_t* size) {
-    const pyemu_gbc_system* gbc = (const pyemu_gbc_system*)system;
+    /* Cast away const to refresh the ERAM window cache before returning the
+       flat memory array. This is a read-only cache sync, not a real mutation. */
+    pyemu_gbc_system* gbc = (pyemu_gbc_system*)system;
     if (size != NULL) {
         *size = PYEMU_GBC_MEMORY_SIZE;
     }
+    pyemu_gbc_refresh_eram_window(gbc);
     return gbc->memory;
 }
 
@@ -1308,7 +1525,26 @@ static void pyemu_gbc_poke_memory(pyemu_system* system, uint16_t address, uint8_
     if (gbc == NULL) {
         return;
     }
+    /* For ERAM addresses, bypass ram_enabled check so debugger/tool pokes always
+       work regardless of MBC state. Write to both eram[] and the memory[] mirror. */
+    if (address >= 0xA000 && address <= 0xBFFF && pyemu_gbc_has_external_ram(gbc)) {
+        size_t offset = pyemu_gbc_current_eram_offset(gbc) + (size_t)(address - 0xA000);
+        if (offset < gbc->eram_size) {
+            gbc->eram[offset] = value;
+            gbc->memory[address] = value;
+            gbc->battery_dirty = 1;
+        }
+        return;
+    }
     pyemu_gbc_write_memory(gbc, address, value);
+}
+
+static uint8_t pyemu_gbc_peek_memory_vtable(pyemu_system* system, uint16_t address) {
+    const pyemu_gbc_system* gbc = (const pyemu_gbc_system*)system;
+    if (gbc == NULL) {
+        return 0xFF;
+    }
+    return pyemu_gbc_peek_memory(gbc, address);
 }
 
 static int pyemu_gbc_has_rom_loaded(const pyemu_system* system) {
@@ -1383,9 +1619,10 @@ static const pyemu_system_vtable pyemu_gbc_vtable = {
     pyemu_gbc_destroy,
     pyemu_gbc_get_cpu_state,
     pyemu_gbc_get_frame_buffer,
-    NULL,
+    pyemu_gbc_get_audio_buffer,
     pyemu_gbc_get_memory,
     pyemu_gbc_poke_memory,
+    pyemu_gbc_peek_memory_vtable,
     pyemu_gbc_has_rom_loaded,
     pyemu_gbc_get_rom_path,
     pyemu_gbc_get_cartridge_title,

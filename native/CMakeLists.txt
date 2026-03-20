@@ -1,3 +1,6 @@
+cmake_minimum_required(VERSION 3.15)
+project(pyemu_native C)
+
 add_library(pyemu_native SHARED
     src/core/emulator.c
     src/systems/gameboy/gameboy_system.c
@@ -8,6 +11,9 @@ add_library(pyemu_native SHARED
     src/systems/gameboy/cpu_helpers.c
     src/systems/gameboy/cpu_core.c
     src/systems/gameboy/cpu_exec.c
+    src/systems/gbc/gbc_system.c
+    src/systems/gbc/gbc_helpers.c
+    src/systems/gbc/gbc_apu.c
 )
 
 target_include_directories(pyemu_native

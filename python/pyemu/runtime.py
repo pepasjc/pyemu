@@ -243,48 +243,47 @@ DMG_PALETTE_SETTING = CoreSettingInfo(
 GBC_COLOR_SETTING = CoreSettingInfo(
     key="display_palette",
     label="Display Colors",
-    options=(
-        CoreSettingOptionInfo("native", "Native Color"),
-    ),
+    options=(CoreSettingOptionInfo("native", "Native Color"),),
     default="native",
 )
 
 
 def compatible_system_keys_for_media(path: str) -> list[str]:
     media_path = Path(path)
-    suffix = media_path.suffix.lower().lstrip('.')
+    suffix = media_path.suffix.lower().lstrip(".")
     if not suffix:
         return []
-    if suffix == 'zip':
+    if suffix == "zip":
         try:
             with zipfile.ZipFile(media_path) as archive:
                 inner_suffixes = {
-                    PurePosixPath(member.filename).suffix.lower().lstrip('.')
+                    PurePosixPath(member.filename).suffix.lower().lstrip(".")
                     for member in archive.infolist()
                     if not member.is_dir() and PurePosixPath(member.filename).suffix
                 }
         except (OSError, zipfile.BadZipFile):
             inner_suffixes = set()
-        if 'gbc' in inner_suffixes:
-            return ['gbc']
-        if 'gb' in inner_suffixes:
-            return ['gameboy', 'gbc']
+        if "gbc" in inner_suffixes:
+            return ["gbc"]
+        if "gb" in inner_suffixes:
+            return ["gameboy", "gbc"]
         return [
             key
             for key, system in SUPPORTED_SYSTEMS.items()
-            if 'zip' in system.media_extensions
+            if "zip" in system.media_extensions
         ]
-    if suffix == 'gb':
-        preferred = ('gameboy', 'gbc')
-    elif suffix == 'gbc':
-        preferred = ('gbc',)
+    if suffix == "gb":
+        preferred = ("gameboy", "gbc")
+    elif suffix == "gbc":
+        preferred = ("gbc",)
     else:
         preferred = tuple(SUPPORTED_SYSTEMS.keys())
 
     matches = [
         key
         for key in preferred
-        if key in SUPPORTED_SYSTEMS and suffix in SUPPORTED_SYSTEMS[key].media_extensions
+        if key in SUPPORTED_SYSTEMS
+        and suffix in SUPPORTED_SYSTEMS[key].media_extensions
     ]
     if matches:
         return matches
@@ -560,8 +559,16 @@ class Emulator:
         if hasattr(self._backend, "poke_memory"):
             self._backend.poke_memory(address, value)
 
+    def peek_memory(self, address: int) -> int:
+        if hasattr(self._backend, "peek_memory"):
+            return self._backend.peek_memory(address)
+        return 0xFF
+
     def set_gameboy_joypad_state(self, buttons: int, directions: int) -> None:
-        if hasattr(self._backend, "set_gameboy_joypad_state"):
+        if self._system.key == "gbc":
+            if hasattr(self._backend, "set_gbc_joypad_state"):
+                self._backend.set_gbc_joypad_state(buttons, directions)
+        elif hasattr(self._backend, "set_gameboy_joypad_state"):
             self._backend.set_gameboy_joypad_state(buttons, directions)
 
     def set_bus_tracking(self, enabled: bool) -> None:
@@ -747,10 +754,10 @@ class _NativeEmulator:
         path_ptr = self._lib.pyemu_get_rom_path(self._handle)
         return MediaInfo(
             loaded=bool(self._lib.pyemu_has_rom_loaded(self._handle)),
-            path=self._ffi.string(path_ptr).decode("utf-8")
+            path=self._ffi.string(path_ptr).decode("utf-8", errors="replace")
             if path_ptr != self._ffi.NULL
             else "",
-            title=self._ffi.string(title_ptr).decode("utf-8")
+            title=self._ffi.string(title_ptr).decode("utf-8", errors="replace")
             if title_ptr != self._ffi.NULL
             else "",
             size_bytes=int(self._lib.pyemu_get_rom_size(self._handle)),
@@ -814,9 +821,20 @@ class _NativeEmulator:
                 self._handle, int(address) & 0xFFFF, int(value) & 0xFF
             )
 
+    def peek_memory(self, address: int) -> int:
+        if hasattr(self._lib, "pyemu_peek_memory"):
+            return int(self._lib.pyemu_peek_memory(self._handle, int(address) & 0xFFFF))
+        return 0xFF
+
     def set_gameboy_joypad_state(self, buttons: int, directions: int) -> None:
         if hasattr(self._lib, "pyemu_set_gameboy_joypad_state"):
             self._lib.pyemu_set_gameboy_joypad_state(
+                self._handle, int(buttons) & 0x0F, int(directions) & 0x0F
+            )
+
+    def set_gbc_joypad_state(self, buttons: int, directions: int) -> None:
+        if hasattr(self._lib, "pyemu_set_gbc_joypad_state"):
+            self._lib.pyemu_set_gbc_joypad_state(
                 self._handle, int(buttons) & 0x0F, int(directions) & 0x0F
             )
 
@@ -835,6 +853,28 @@ class _NativeEmulator:
                 valid=bool(access.valid),
             )
         return LastBusAccess()
+
+    @property
+    def cartridge_debug(self) -> CartridgeDebugInfo:
+        if hasattr(self._lib, "pyemu_get_cartridge_debug_info"):
+            info = self._lib.pyemu_get_cartridge_debug_info(self._handle)
+            return CartridgeDebugInfo(
+                cartridge_type=int(info.cartridge_type),
+                rom_size_code=int(info.rom_size_code),
+                ram_size_code=int(info.ram_size_code),
+                ram_enabled=bool(info.ram_enabled),
+                rom_bank=int(info.rom_bank),
+                ram_bank=int(info.ram_bank),
+                banking_mode=int(info.banking_mode),
+                has_battery=bool(info.has_battery),
+                save_file_present=bool(info.save_file_present),
+                last_mapper_value=int(info.last_mapper_value),
+                last_mapper_valid=bool(info.last_mapper_valid),
+                last_mapper_address=int(info.last_mapper_address),
+                rom_bank_count=int(info.rom_bank_count),
+                ram_bank_count=int(info.ram_bank_count),
+            )
+        return CartridgeDebugInfo()
 
     def __del__(self) -> None:
         handle = getattr(self, "_handle", None)
@@ -943,7 +983,16 @@ class _FallbackEmulator:
         if 0 <= int(address) < len(self._memory):
             self._memory[int(address)] = int(value) & 0xFF
 
+    def peek_memory(self, address: int) -> int:
+        if 0 <= int(address) < len(self._memory):
+            return self._memory[int(address)]
+        return 0xFF
+
     def set_gameboy_joypad_state(self, buttons: int, directions: int) -> None:
+        self._memory[0xFF80] = buttons & 0x0F
+        self._memory[0xFF81] = directions & 0x0F
+
+    def set_gbc_joypad_state(self, buttons: int, directions: int) -> None:
         self._memory[0xFF80] = buttons & 0x0F
         self._memory[0xFF81] = directions & 0x0F
 
@@ -953,6 +1002,10 @@ class _FallbackEmulator:
     @property
     def last_bus_access(self) -> LastBusAccess:
         return LastBusAccess()
+
+    @property
+    def cartridge_debug(self) -> CartridgeDebugInfo:
+        return CartridgeDebugInfo()
 
 
 def _create_native_emulator(ffi: FFI, lib, system_key: str):
@@ -1090,6 +1143,7 @@ def _load_native_library() -> tuple[FFI, object, Path] | None:
         pyemu_audio_buffer pyemu_get_audio_buffer(const pyemu_emulator* emulator);
         const uint8_t* pyemu_get_memory(const pyemu_emulator* emulator, size_t* size);
         void pyemu_poke_memory(pyemu_emulator* emulator, uint16_t address, uint8_t value);
+        uint8_t pyemu_peek_memory(pyemu_emulator* emulator, uint16_t address);
         int pyemu_has_rom_loaded(const pyemu_emulator* emulator);
         const char* pyemu_get_rom_path(const pyemu_emulator* emulator);
         const char* pyemu_get_cartridge_title(const pyemu_emulator* emulator);
@@ -1101,6 +1155,7 @@ def _load_native_library() -> tuple[FFI, object, Path] | None:
         pyemu_audio_buffer pyemu_get_gameboy_audio_channel_buffer(const pyemu_emulator* emulator, int channel);
         int pyemu_get_gameboy_audio_debug_info(const pyemu_emulator* emulator, pyemu_gameboy_audio_debug_info* out_info);
         void pyemu_set_gameboy_joypad_state(pyemu_emulator* emulator, uint8_t buttons, uint8_t directions);
+        void pyemu_set_gbc_joypad_state(pyemu_emulator* emulator, uint8_t buttons, uint8_t directions);
         void pyemu_set_bus_tracking(pyemu_emulator* emulator, int enabled);
         """
     )
@@ -1116,6 +1171,28 @@ def _library_candidates() -> list[Path]:
     workspace_root = package_root.parent.parent
     if sys.platform.startswith("win"):
         return [
+            workspace_root / "build" / "native" / "pyemu_native_timed165.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed141.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed164.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed163.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed162.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed161.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed160.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed159.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed158.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed157.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed156.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed154.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed153.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed152.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed151.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed150.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed149.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed148.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed147.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed146.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed143.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed142.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed140.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed139.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed138.dll",

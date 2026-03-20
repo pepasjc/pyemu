@@ -1165,6 +1165,14 @@ static void pyemu_gameboy_poke_memory(pyemu_system* system, uint16_t address, ui
     pyemu_gameboy_write_memory(gb, address, value);
 }
 
+static uint8_t pyemu_gameboy_peek_memory_vtable(pyemu_system* system, uint16_t address) {
+    const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
+    if (gb == NULL) {
+        return 0xFF;
+    }
+    return pyemu_gameboy_peek_memory(gb, address);
+}
+
 static int pyemu_gameboy_has_rom_loaded(const pyemu_system* system) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     return gb->rom_loaded;
@@ -1240,6 +1248,7 @@ static const pyemu_system_vtable pyemu_gameboy_vtable = {
     pyemu_gameboy_get_audio_buffer,
     pyemu_gameboy_get_memory,
     pyemu_gameboy_poke_memory,
+    pyemu_gameboy_peek_memory_vtable,
     pyemu_gameboy_has_rom_loaded,
     pyemu_gameboy_get_rom_path,
     pyemu_gameboy_get_cartridge_title,

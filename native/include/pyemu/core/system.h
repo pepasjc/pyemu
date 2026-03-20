@@ -27,6 +27,7 @@ typedef struct pyemu_system_vtable {
     void (*get_audio_buffer)(const pyemu_system* system, pyemu_audio_buffer* out_audio);
     const uint8_t* (*get_memory)(const pyemu_system* system, size_t* size);
     void (*poke_memory)(pyemu_system* system, uint16_t address, uint8_t value);
+    uint8_t (*peek_memory)(pyemu_system* system, uint16_t address);
     int (*has_rom_loaded)(const pyemu_system* system);
     const char* (*get_rom_path)(const pyemu_system* system);
     const char* (*get_cartridge_title)(const pyemu_system* system);
