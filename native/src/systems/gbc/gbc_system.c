@@ -440,9 +440,11 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
         } else if (!(previous & 0x80) && (value & 0x80)) {
             gbc->ppu_counter = 0;
             gbc->memory[PYEMU_IO_LY] = 0;
+            gbc->window_line_counter = 0;
             gbc->stat_irq_line = 0;
             gbc->stat_mode = 2;
             gbc->stat_coincidence = 0;
+            pyemu_gbc_latch_scanline_registers(gbc, 0);
         }
         pyemu_gbc_update_stat(gbc);
         pyemu_gbc_record_access(gbc, address, value, 1);
@@ -1019,10 +1021,17 @@ static int pyemu_gbc_execute_opcode(pyemu_gbc_system* gbc, uint8_t opcode) {
             gbc->ime_delay = 0;
             cycles = 4;
             break;
-        case 0xF8:
-            pyemu_gbc_set_hl(gbc, pyemu_gbc_sp_plus_signed(gbc, (int8_t)pyemu_gbc_fetch_u8(gbc)));
+        case 0xF8: {
+            int8_t offset = (int8_t)pyemu_gbc_fetch_u8(gbc);
+            uint16_t sp = gbc->cpu.sp;
+            uint32_t result = (uint32_t)((int)sp + (int)offset);
+            int h = (int)(((sp ^ offset ^ result) & 0x10) != 0);
+            int c = (int)(((sp ^ offset ^ result) & 0x100) != 0);
+            pyemu_gbc_set_hl(gbc, (uint16_t)result);
+            pyemu_gbc_set_flags_znhc(gbc, 0, 0, h, c);
             cycles = 12;
             break;
+        }
         case 0xFA: {
             uint16_t address = pyemu_gbc_fetch_u16(gbc);
             gbc->cpu.a = pyemu_gbc_read_memory(gbc, address);

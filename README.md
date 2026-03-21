@@ -33,6 +33,9 @@ The current system is the Nintendo Game Boy, but the project is structured as a 
 Start here if you want to understand or extend the emulator:
 - [Architecture](E:/projects/pyemu/docs/architecture.md)
 - [Adding a Core](E:/projects/pyemu/docs/adding-a-core.md)
+- [Testing Cores](E:/projects/pyemu/docs/testing.md)
+
+The refactored Game Boy core is the current baseline/template for drafting new systems.
 
 ## Setup with uv
 

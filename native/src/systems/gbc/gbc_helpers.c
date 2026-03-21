@@ -429,7 +429,7 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
             uint8_t map_y = (uint8_t)(y + scy);
             uint16_t bg_map_base = (lcdc & 0x08) ? 0x9C00 : 0x9800;
             uint16_t tile_map_address = (uint16_t)(bg_map_base + ((map_y / 8) * 32) + (map_x / 8));
-            uint8_t tile_index = gbc->memory[tile_map_address];
+            uint8_t tile_index = gbc->vram[tile_map_address - 0x8000];
             
             uint8_t tile_attr = gbc->vram[tile_map_address - 0x8000 + 0x2000];
             uint8_t tile_bank = (uint8_t)((tile_attr & 0x08) ? 1 : 0);
@@ -459,7 +459,7 @@ static void pyemu_gbc_render_scanline(pyemu_gbc_system* gbc, uint8_t y) {
                 uint8_t win_y = gbc->line_win_y[y];
                 uint16_t win_map_base = (lcdc & 0x40) ? 0x9C00 : 0x9800;
                 uint16_t win_tile_map_address = (uint16_t)(win_map_base + ((win_y / 8) * 32) + (win_x / 8));
-                uint8_t win_tile_index = gbc->memory[win_tile_map_address];
+                uint8_t win_tile_index = gbc->vram[win_tile_map_address - 0x8000];
                 
                 uint8_t win_tile_attr = gbc->vram[win_tile_map_address - 0x8000 + 0x2000];
                 uint8_t win_tile_bank = (uint8_t)((win_tile_attr & 0x08) ? 1 : 0);

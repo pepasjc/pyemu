@@ -269,39 +269,78 @@ These are the practical bring-up wins that are currently established:
 - reaches much later boot/runtime code
 - produces real framebuffer output instead of staying permanently black
 
+### 9. Renderer VBK tile-index bug fix
+
+Files:
+
+- [E:\projects\pyemu\native\src\systems\gbc\gbc_helpers.c](E:/projects/pyemu/native/src/systems/gbc/gbc_helpers.c)
+
+The GBC renderer was reading tile map indices (tile numbers) from `gbc->memory[tile_map_address]`, which reflects whatever VRAM bank is currently mapped via `VBK`. When `VBK=1` was active during a scanline render, the tile map address range `0x9800-0x9FFF` in `gbc->memory` contained VRAM bank 1 data (tile attributes), not bank 0 tile indices. This produced garbage tile indices and corrupted visuals.
+
+Fix:
+
+- BG tile map: changed to `gbc->vram[tile_map_address - 0x8000]` (always VRAM bank 0)
+- Window tile map: same fix applied
+
+The tile attribute reads (`gbc->vram[... + 0x2000]`) were already always reading from bank 1 and were correct.
+
+Result:
+
+- visual corruption caused by wrong tile indices when `VBK=1` is eliminated
+
+### 10. LCD-on transition: window counter and scanline register latch
+
+Files:
+
+- [E:\projects\pyemu\native\src\systems\gbc\gbc_system.c](E:/projects/pyemu/native/src/systems/gbc/gbc_system.c)
+
+When LCDC bit 7 transitions from 0 to 1 (LCD turns on), the window line counter was not reset and scanline registers for line 0 were not latched from the current IO state.
+
+Fixes:
+
+- reset `window_line_counter` to 0 on LCD turn-on
+- call `pyemu_gbc_latch_scanline_registers(gbc, 0)` on LCD turn-on so line 0 uses the current SCX, SCY, LCDC, etc. rather than stale values from a previous frame
+
+### 11. Opcode 0xF8 (`LD HL, SP+r8`) missing flag updates
+
+Files:
+
+- [E:\projects\pyemu\native\src\systems\gbc\gbc_system.c](E:/projects/pyemu/native/src/systems/gbc/gbc_system.c)
+
+`LD HL, SP+r8` was computing the correct HL value but not updating the H and C flags. The SM83 specification requires this instruction to set H and C the same way as `ADD SP, r8` (based on the low-byte addition), with Z=0 and N=0.
+
+Fix:
+
+- compute H and C flags from `(SP ^ offset ^ result)` and apply with `pyemu_gbc_set_flags_znhc`
+
 ## Current Active Problem
 
 ### Super Mario Bros. Deluxe
 
 Current symptoms:
 
-- visuals switch between correct-looking background and obvious garbage
 - audio is present but sounds wrong
-- the game appears to be unstable around transition/copy phases rather than simply failing to boot
+- the game may still have remaining visual issues beyond the VBK renderer fix
+
+The main visual corruption (garbage frames when VBK=1 during rendering) has been fixed. The remaining issues are likely:
+
+- APU accuracy (sounds wrong is a separate channel/envelope correctness problem)
+- any remaining transition-phase bugs not yet triggered
 
 Current strongest leads:
 
-- remaining MBC5 / banked transition correctness
-- remaining LCD-off / LCD-on transition behavior
-- copy/transfer-state behavior during the long banked loop around `0x145A`
-- APU accuracy, which may be a separate issue from the visual corruption
-
-Important distinction:
-
-- `Mario Deluxe` is not failing in the same way `Pokemon Crystal` was
-- the Crystal blocker was mainly the weak timing/model path
-- the Mario Deluxe blocker now looks more like "real game correctness under transitions"
+- APU channel correctness, envelopes, timing, sequencing
+- run the game again and collect a new trace to re-evaluate visual stability
 
 ## What Needs To Happen Next
 
-### 1. Finish Mario Deluxe bring-up
+### 1. Validate Mario Deluxe after renderer fix
 
 Recommended next steps:
 
-- keep tracing the `0x145A` banked copy/transition loop
-- log mapper writes, `LCDC`, `STAT`, and bank state at instruction granularity during the bad phase
-- verify that the banked continuation path is always using the intended MBC5 bank values
-- confirm whether the visual corruption and bad audio stem from the same transition bug or from separate video/APU issues
+- run `Super Mario Bros. Deluxe` and collect a new trace
+- check whether visuals are now stable or whether new corruption patterns appear
+- if new garbage appears, instrument `VBK`, `LCDC`, and tile map writes at scanline granularity
 
 ### 2. Add GBC regression coverage
 
@@ -347,6 +386,9 @@ The GBC bring-up has progressed through these phases:
 8. MBC5 bring-up and bank-write correction
 9. Audio and RTC support
 10. Real-game validation on `Tetris DX`, `Pokemon Gold`, and `Pokemon Crystal`
+11. Renderer VBK tile-index fix (always read tile map from VRAM bank 0)
+12. LCD-on window counter reset and scanline register latch
+13. `LD HL, SP+r8` (opcode `0xF8`) H/C flag fix
 
 The active front is now much narrower:
 

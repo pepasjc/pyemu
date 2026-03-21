@@ -1,7 +1,10 @@
 #include "gameboy_internal.h"
 
+/* LCD, timer, and framebuffer helpers for the DMG core. This file owns mode timing, scanline latching, and the CPU-visible side effects of the PPU. */
+
 #include <string.h>
 
+/* Collapse the STAT enable bits, coincidence flag, and current mode into the single interrupt line used for edge detection. */
 static uint8_t pyemu_gameboy_stat_irq_signal(uint8_t stat, uint8_t coincidence, uint8_t mode) {
     if (coincidence && (stat & 0x40)) {
         return 1;
@@ -18,10 +21,12 @@ static uint8_t pyemu_gameboy_stat_irq_signal(uint8_t stat, uint8_t coincidence, 
     return 0;
 }
 
+/* Return whether the LCD controller is currently enabled. */
 int pyemu_gameboy_lcd_enabled(const pyemu_gameboy_system* gb) {
     return (gb->memory[PYEMU_IO_LCDC] & 0x80) != 0;
 }
 
+/* Return IF & IE, masked down to the architecturally visible interrupt bits. */
 uint8_t pyemu_gameboy_pending_interrupts(const pyemu_gameboy_system* gb) {
     uint8_t pending = (uint8_t)(gb->memory[PYEMU_IO_IF] & gb->memory[PYEMU_IO_IE] & 0x1F);
     if (!pyemu_gameboy_lcd_enabled(gb)) {
@@ -30,6 +35,7 @@ uint8_t pyemu_gameboy_pending_interrupts(const pyemu_gameboy_system* gb) {
     return pending;
 }
 
+/* Recompute STAT mode/coincidence bits and generate a new LCD interrupt only on a rising edge. */
 void pyemu_gameboy_update_stat(pyemu_gameboy_system* gb) {
     uint8_t stat = gb->memory[PYEMU_IO_STAT];
     uint8_t ly = gb->memory[PYEMU_IO_LY];
@@ -70,6 +76,7 @@ void pyemu_gameboy_update_stat(pyemu_gameboy_system* gb) {
     gb->stat_irq_line = stat_signal;
 }
 
+/* Snapshot scroll/window/palette registers at the start of a visible line so later HBlank writes do not retroactively change it. */
 void pyemu_gameboy_latch_scanline_registers(pyemu_gameboy_system* gb, uint8_t ly) {
     if (ly >= PYEMU_GAMEBOY_HEIGHT) {
         return;
@@ -84,6 +91,7 @@ void pyemu_gameboy_latch_scanline_registers(pyemu_gameboy_system* gb, uint8_t ly
     gb->line_obp1[ly] = gb->memory[PYEMU_IO_OBP1];
 }
 
+/* Return whether CPU reads and writes to VRAM are currently allowed for the active LCD mode. */
 int pyemu_gameboy_cpu_can_access_vram(const pyemu_gameboy_system* gb) {
     uint8_t ly;
 
@@ -99,6 +107,7 @@ int pyemu_gameboy_cpu_can_access_vram(const pyemu_gameboy_system* gb) {
     return gb->ppu_counter < 80U || gb->ppu_counter >= 252U;
 }
 
+/* Return whether CPU reads and writes to OAM are currently allowed for the active LCD mode. */
 int pyemu_gameboy_cpu_can_access_oam(const pyemu_gameboy_system* gb) {
     uint8_t ly;
 
@@ -114,6 +123,7 @@ int pyemu_gameboy_cpu_can_access_oam(const pyemu_gameboy_system* gb) {
     return gb->ppu_counter >= 252U;
 }
 
+/* Map a two-bit DMG color id through one of the hardware palette registers. */
 static uint8_t pyemu_gameboy_apply_palette(uint8_t palette, uint8_t color_id) {
     static const uint8_t dmg_shades[4] = {255, 170, 85, 0};
     uint8_t shade_index = (uint8_t)((palette >> (color_id * 2)) & 0x03);
@@ -145,6 +155,7 @@ static uint8_t pyemu_gameboy_tile_pixel(
     return (uint8_t)((((high >> bit) & 0x01) << 1) | ((low >> bit) & 0x01));
 }
 
+/* Translate TAC frequency selection into the divider bit watched by the falling-edge TIMA circuit. */
 static uint16_t pyemu_gameboy_timer_bit_mask_from_tac(uint8_t tac) {
     switch (tac & 0x03) {
         case 0x00:
@@ -158,6 +169,7 @@ static uint16_t pyemu_gameboy_timer_bit_mask_from_tac(uint8_t tac) {
     }
 }
 
+/* Return the internal timer signal level for a given DIV/TAC state. */
 static int pyemu_gameboy_timer_signal_from_state(uint32_t div_counter, uint8_t tac) {
     uint16_t mask;
     if ((tac & 0x04) == 0) {
@@ -167,10 +179,12 @@ static int pyemu_gameboy_timer_signal_from_state(uint32_t div_counter, uint8_t t
     return (div_counter & mask) != 0;
 }
 
+/* Return the current timer signal level for the live machine state. */
 int pyemu_gameboy_timer_signal(const pyemu_gameboy_system* gb) {
     return pyemu_gameboy_timer_signal_from_state(gb->div_counter, gb->memory[PYEMU_IO_TAC]);
 }
 
+/* Advance TIMA once, handling overflow reload and timer interrupt generation. */
 static void pyemu_gameboy_increment_tima(pyemu_gameboy_system* gb) {
     uint8_t tima = gb->memory[PYEMU_IO_TIMA];
     if (tima == 0xFF) {
@@ -181,12 +195,14 @@ static void pyemu_gameboy_increment_tima(pyemu_gameboy_system* gb) {
     }
 }
 
+/* Apply the DMG timer's falling-edge behavior after a DIV or TAC transition. */
 void pyemu_gameboy_apply_timer_edge(pyemu_gameboy_system* gb, int old_signal, int new_signal) {
     if (old_signal && !new_signal) {
         pyemu_gameboy_increment_tima(gb);
     }
 }
 
+/* Render one visible scanline into the RGBA framebuffer using the register values latched for that line. */
 static void pyemu_gameboy_render_scanline(pyemu_gameboy_system* gb, uint8_t y) {
     int x;
     int sprite_index;
@@ -297,6 +313,7 @@ static void pyemu_gameboy_render_scanline(pyemu_gameboy_system* gb, uint8_t y) {
     }
 }
 
+/* Generate a placeholder frame when no ROM is loaded so the frontend has something stable to display. */
 void pyemu_gameboy_update_demo_frame(pyemu_gameboy_system* gb) {
     int y;
 
@@ -305,6 +322,7 @@ void pyemu_gameboy_update_demo_frame(pyemu_gameboy_system* gb) {
     }
 }
 
+/* Advance timers, LCD modes, scanline rendering, and interrupt state for a block of CPU cycles. */
 void pyemu_gameboy_tick(pyemu_gameboy_system* gb, int cycles) {
     uint32_t old_div_counter = gb->div_counter;
     uint8_t tac = gb->memory[PYEMU_IO_TAC];
@@ -394,6 +412,7 @@ void pyemu_gameboy_tick(pyemu_gameboy_system* gb, int cycles) {
     }
 }
 
+/* Estimate how many cycles remain before the next VBlank entry from the current PPU state. */
 uint32_t pyemu_gameboy_cycles_until_vblank(const pyemu_gameboy_system* gb) {
     uint8_t ly = gb->memory[PYEMU_IO_LY];
     uint32_t lines_until_vblank;
@@ -409,6 +428,7 @@ uint32_t pyemu_gameboy_cycles_until_vblank(const pyemu_gameboy_system* gb) {
     return (PYEMU_GAMEBOY_CYCLES_PER_SCANLINE - gb->ppu_counter) + (lines_until_vblank * PYEMU_GAMEBOY_CYCLES_PER_SCANLINE);
 }
 
+/* Skip idle LCD time to the next VBlank while still preserving all visible side effects that the frame loop expects. */
 void pyemu_gameboy_fast_forward_to_vblank(pyemu_gameboy_system* gb) {
     uint8_t line;
     uint32_t skip_cycles = pyemu_gameboy_cycles_until_vblank(gb);

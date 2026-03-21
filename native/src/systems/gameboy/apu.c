@@ -1,12 +1,16 @@
 #include "gameboy_internal.h"
 
+/* First-pass DMG APU implementation. This file owns channel state, register-trigger behavior, and mixed/per-channel PCM export for the frontend debugger. */
+
 #include <string.h>
 
+/* Translate the DMG pulse duty code into the high portion of a unit waveform cycle. */
 static float pyemu_gameboy_pulse_duty(uint8_t duty) {
     static const float duty_cycles[4] = {0.125f, 0.25f, 0.5f, 0.75f};
     return duty_cycles[duty & 0x03];
 }
 
+/* Read the raw frequency register pair for pulse channel 1 or 2. */
 static uint16_t pyemu_gameboy_channel_frequency_raw(const pyemu_gameboy_system* gb, int channel) {
     if (channel == 1) {
         return (uint16_t)(gb->memory[0xFF13] | ((uint16_t)(gb->memory[0xFF14] & 0x07) << 8));
@@ -14,15 +18,18 @@ static uint16_t pyemu_gameboy_channel_frequency_raw(const pyemu_gameboy_system* 
     return (uint16_t)(gb->memory[0xFF18] | ((uint16_t)(gb->memory[0xFF19] & 0x07) << 8));
 }
 
+/* Read the raw frequency register pair for channel 3. */
 static uint16_t pyemu_gameboy_wave_frequency_raw(const pyemu_gameboy_system* gb) {
     return (uint16_t)(gb->memory[0xFF1D] | ((uint16_t)(gb->memory[0xFF1E] & 0x07) << 8));
 }
 
+/* Translate the wave channel volume code into a linear amplitude scale. */
 static float pyemu_gameboy_wave_volume_scale(uint8_t volume_code) {
     static const float scales[4] = {0.0f, 1.0f, 0.5f, 0.25f};
     return scales[volume_code & 0x03];
 }
 
+/* Approximate the noise channel clock frequency from NR43 settings. */
 static float pyemu_gameboy_noise_frequency(const pyemu_gameboy_noise_channel* noise) {
     static const float divisors[8] = {0.5f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f};
     float divisor = divisors[noise->divisor_code & 0x07];
@@ -30,6 +37,7 @@ static float pyemu_gameboy_noise_frequency(const pyemu_gameboy_noise_channel* no
     return 524288.0f / divisor / scale;
 }
 
+/* Sample channel 3 wave RAM at the current waveform phase. */
 static uint8_t pyemu_gameboy_wave_sample(const pyemu_gameboy_system* gb, float phase) {
     uint32_t position = ((uint32_t)(phase * 32.0f)) & 31u;
     uint8_t packed = gb->memory[0xFF30 + (position >> 1)];
@@ -39,6 +47,7 @@ static uint8_t pyemu_gameboy_wave_sample(const pyemu_gameboy_system* gb, float p
     return (uint8_t)(packed & 0x0F);
 }
 
+/* Advance the simplified noise envelope and length counters once per mixed audio frame. */
 static void pyemu_gameboy_update_noise_state_for_frame(pyemu_gameboy_system* gb) {
     pyemu_gameboy_noise_channel* noise = &gb->noise;
 
@@ -77,6 +86,7 @@ static void pyemu_gameboy_update_noise_state_for_frame(pyemu_gameboy_system* gb)
     }
 }
 
+/* Apply a pulse-channel trigger write by reloading cached synth state from hardware registers. */
 static void pyemu_gameboy_trigger_pulse(pyemu_gameboy_system* gb, int channel) {
     pyemu_gameboy_pulse_channel* pulse = channel == 1 ? &gb->pulse1 : &gb->pulse2;
     uint8_t length_reg = channel == 1 ? gb->memory[0xFF11] : gb->memory[0xFF16];
@@ -94,6 +104,7 @@ static void pyemu_gameboy_trigger_pulse(pyemu_gameboy_system* gb, int channel) {
     pulse->phase = 0.0f;
 }
 
+/* Apply a wave-channel trigger write by reloading cached synth state from hardware registers. */
 static void pyemu_gameboy_trigger_wave(pyemu_gameboy_system* gb) {
     if ((gb->memory[0xFF26] & 0x80) == 0) {
         gb->wave.enabled = 0;
@@ -106,6 +117,7 @@ static void pyemu_gameboy_trigger_wave(pyemu_gameboy_system* gb) {
     gb->wave.phase = 0.0f;
 }
 
+/* Apply a noise-channel trigger write by reloading cached synth state from hardware registers. */
 static void pyemu_gameboy_trigger_noise(pyemu_gameboy_system* gb) {
     uint8_t nr42;
     uint8_t nr43;
@@ -136,6 +148,7 @@ static void pyemu_gameboy_trigger_noise(pyemu_gameboy_system* gb) {
     gb->noise.phase = 0.0f;
 }
 
+/* React to writes in the APU register space so cached channel state stays aligned with memory-mapped registers. */
 void pyemu_gameboy_apu_handle_write(pyemu_gameboy_system* gb, uint16_t address, uint8_t value) {
     switch (address) {
         case 0xFF11:
@@ -217,6 +230,7 @@ void pyemu_gameboy_apu_handle_write(pyemu_gameboy_system* gb, uint16_t address, 
     }
 }
 
+/* Synthesize one video-frame worth of stereo PCM and per-channel debug output. */
 void pyemu_gameboy_update_audio_frame(pyemu_gameboy_system* gb) {
     size_t index;
     float left_master;
@@ -359,6 +373,7 @@ void pyemu_gameboy_update_audio_frame(pyemu_gameboy_system* gb) {
     }
 }
 
+/* Export the mixed PCM frame buffer to the frontend audio sink. */
 void pyemu_gameboy_get_audio_buffer(const pyemu_system* system, pyemu_audio_buffer* out_audio) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     if (out_audio == NULL) {
@@ -370,6 +385,7 @@ void pyemu_gameboy_get_audio_buffer(const pyemu_system* system, pyemu_audio_buff
     out_audio->sample_count = PYEMU_GAMEBOY_AUDIO_SAMPLE_COUNT;
 }
 
+/* Export a single debug audio channel buffer for waveform dumps and APU inspection. */
 pyemu_audio_buffer pyemu_gameboy_get_audio_channel_buffer(const pyemu_system* system, int channel) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     pyemu_audio_buffer out_audio;
@@ -384,6 +400,7 @@ pyemu_audio_buffer pyemu_gameboy_get_audio_channel_buffer(const pyemu_system* sy
     return out_audio;
 }
 
+/* Export cached high-level channel state for the debugger APU panel. */
 void pyemu_gameboy_get_audio_debug_info(const pyemu_system* system, pyemu_gameboy_audio_debug_info* out_info) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     if (gb == NULL || out_info == NULL) {

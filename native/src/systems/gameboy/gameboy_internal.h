@@ -240,9 +240,14 @@ typedef struct pyemu_gameboy_state_file {
     int faulted;
 } pyemu_gameboy_state_file;
 
+/* APU surface: synthesize one frame of mixed audio, react to register writes,
+ * and export PCM/debug buffers to the frontend. */
 void pyemu_gameboy_update_audio_frame(pyemu_gameboy_system* gb);
 void pyemu_gameboy_apu_handle_write(pyemu_gameboy_system* gb, uint16_t address, uint8_t value);
 void pyemu_gameboy_get_audio_buffer(const pyemu_system* system, pyemu_audio_buffer* out_audio);
+
+/* Cartridge helpers: identify mapper capabilities and translate cartridge header
+ * values into concrete banking/storage behavior. */
 int pyemu_gameboy_uses_mbc1(const pyemu_gameboy_system* gb);
 int pyemu_gameboy_uses_mbc3(const pyemu_gameboy_system* gb);
 int pyemu_gameboy_has_battery(const pyemu_gameboy_system* gb);
@@ -258,10 +263,24 @@ int pyemu_gameboy_save_battery_ram(const pyemu_gameboy_system* gb);
 void pyemu_gameboy_load_battery_ram(pyemu_gameboy_system* gb);
 void pyemu_gameboy_refresh_rom_mapping(pyemu_gameboy_system* gb);
 void pyemu_gameboy_refresh_eram_window(pyemu_gameboy_system* gb);
+
+/* Bus / memory helpers: expose the CPU-visible memory map, keep the mirrored
+ * memory image synchronized, and capture the last tracked access for the debugger. */
+void pyemu_gameboy_record_access(pyemu_gameboy_system* gb, uint16_t address, uint8_t value, int is_write);
+void pyemu_gameboy_sync_memory(pyemu_gameboy_system* gb);
+uint8_t pyemu_gameboy_peek_memory(const pyemu_gameboy_system* gb, uint16_t address);
+uint8_t pyemu_gameboy_read_memory(const pyemu_gameboy_system* gb, uint16_t address);
+void pyemu_gameboy_write_memory(pyemu_gameboy_system* gb, uint16_t address, uint8_t value);
+
+/* Input helpers: compute the current FF00 value, refresh joypad-driven interrupt
+ * state, and bridge frontend button state into the core. */
 uint8_t pyemu_gameboy_current_joypad_value(const pyemu_gameboy_system* gb);
 void pyemu_gameboy_refresh_joypad(pyemu_gameboy_system* gb, uint8_t previous_value);
 void pyemu_gameboy_set_joypad_state(pyemu_system* system, uint8_t buttons, uint8_t directions);
 void pyemu_gameboy_set_bus_tracking(pyemu_system* system, int enabled);
+
+/* PPU / timer helpers: derive LCD mode state, enforce CPU access restrictions,
+ * run scanline/frame rendering, and advance timer/PPU side effects for a CPU tick. */
 void pyemu_gameboy_request_interrupt(pyemu_gameboy_system* gb, uint8_t mask);
 int pyemu_gameboy_lcd_enabled(const pyemu_gameboy_system* gb);
 uint8_t pyemu_gameboy_pending_interrupts(const pyemu_gameboy_system* gb);
@@ -275,6 +294,9 @@ void pyemu_gameboy_update_demo_frame(pyemu_gameboy_system* gb);
 void pyemu_gameboy_tick(pyemu_gameboy_system* gb, int cycles);
 uint32_t pyemu_gameboy_cycles_until_vblank(const pyemu_gameboy_system* gb);
 void pyemu_gameboy_fast_forward_to_vblank(pyemu_gameboy_system* gb);
+
+/* Register-pair and flag helpers: provide a shared way to read/write 16-bit
+ * register pairs and update flags consistently across opcode handlers. */
 uint16_t pyemu_gameboy_get_af(const pyemu_gameboy_system* gb);
 uint16_t pyemu_gameboy_get_bc(const pyemu_gameboy_system* gb);
 uint16_t pyemu_gameboy_get_de(const pyemu_gameboy_system* gb);
@@ -286,6 +308,9 @@ void pyemu_gameboy_set_hl(pyemu_gameboy_system* gb, uint16_t value);
 void pyemu_gameboy_set_flag(pyemu_gameboy_system* gb, uint8_t mask, int enabled);
 int pyemu_gameboy_get_flag(const pyemu_gameboy_system* gb, uint8_t mask);
 void pyemu_gameboy_set_flags_znhc(pyemu_gameboy_system* gb, int z, int n, int h, int c);
+
+/* ALU helpers: implement the arithmetic/bit-manipulation rules shared by many
+ * opcodes so the dispatch layer can stay mechanical and consistent. */
 uint8_t pyemu_gameboy_inc8(pyemu_gameboy_system* gb, uint8_t value);
 uint8_t pyemu_gameboy_dec8(pyemu_gameboy_system* gb, uint8_t value);
 uint8_t pyemu_gameboy_swap8(pyemu_gameboy_system* gb, uint8_t value);
@@ -312,17 +337,28 @@ uint16_t pyemu_gameboy_sp_plus_signed(pyemu_gameboy_system* gb, int8_t value);
 void pyemu_gameboy_bit_test(pyemu_gameboy_system* gb, uint8_t value, uint8_t bit);
 void pyemu_gameboy_add_hl(pyemu_gameboy_system* gb, uint16_t value);
 void pyemu_gameboy_daa(pyemu_gameboy_system* gb);
-uint8_t pyemu_gameboy_peek_memory(const pyemu_gameboy_system* gb, uint16_t address);
-uint8_t pyemu_gameboy_read_memory(const pyemu_gameboy_system* gb, uint16_t address);
-void pyemu_gameboy_write_memory(pyemu_gameboy_system* gb, uint16_t address, uint8_t value);
+
+/* Core lifecycle helpers: derive cartridge metadata, establish the post-boot
+ * machine state, reset live state, and serialize/deserialize snapshots. */
+void pyemu_gameboy_extract_title(pyemu_gameboy_system* gb);
+void pyemu_gameboy_set_post_boot_state(pyemu_gameboy_system* gb);
+void pyemu_gameboy_reset_state(pyemu_gameboy_system* gb);
+int pyemu_gameboy_load_rom_file(pyemu_gameboy_system* gb, const char* path);
+int pyemu_gameboy_save_state_file(const pyemu_gameboy_system* gb, const char* path);
+int pyemu_gameboy_load_state_file(pyemu_gameboy_system* gb, const char* path);
+
+/* CPU core helpers: fetch instruction operands, manage stack traffic, service
+ * interrupts, and expose register-indexed access for dispatcher helpers. */
 uint8_t pyemu_gameboy_fetch_u8(pyemu_gameboy_system* gb);
 uint16_t pyemu_gameboy_fetch_u16(pyemu_gameboy_system* gb);
 void pyemu_gameboy_push_u16(pyemu_gameboy_system* gb, uint16_t value);
 uint16_t pyemu_gameboy_pop_u16(pyemu_gameboy_system* gb);
-void pyemu_gameboy_request_interrupt(pyemu_gameboy_system* gb, uint8_t mask);
 int pyemu_gameboy_service_interrupts(pyemu_gameboy_system* gb);
 uint8_t pyemu_gameboy_read_r8(pyemu_gameboy_system* gb, int index);
 void pyemu_gameboy_write_r8(pyemu_gameboy_system* gb, int index, uint8_t value);
+
+/* CPU execution helpers: handle the opcode families peeled out of the main
+ * dispatch function so the interpreter remains readable and refactorable. */
 int pyemu_gameboy_execute_cb(pyemu_gameboy_system* gb);
 int pyemu_gameboy_execute_load_store(pyemu_gameboy_system* gb, uint8_t opcode);
 int pyemu_gameboy_execute_control_flow(pyemu_gameboy_system* gb, uint8_t opcode);

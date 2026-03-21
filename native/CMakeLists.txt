@@ -8,6 +8,8 @@ add_library(pyemu_native SHARED
     src/systems/gameboy/mapper.c
     src/systems/gameboy/ppu.c
     src/systems/gameboy/input.c
+    src/systems/gameboy/memory.c
+    src/systems/gameboy/state.c
     src/systems/gameboy/cpu_helpers.c
     src/systems/gameboy/cpu_core.c
     src/systems/gameboy/cpu_exec.c

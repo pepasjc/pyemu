@@ -21,6 +21,7 @@ artifacts/
 external/
 roms/
 states/
+probes/
 traces/
 SLOT/
 *.gb

@@ -1,13 +1,21 @@
 #include "gameboy_internal.h"
 
+/* Top-level DMG system glue. This file wires subsystem modules into the emulator vtable and keeps the block-cache driven execution loop in one place. */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static void pyemu_gameboy_step_instruction_internal(pyemu_gameboy_system* gb, int render_frame);
 static void pyemu_gameboy_get_cartridge_debug_info(const pyemu_system* system, pyemu_cartridge_debug_info* out_info);
-static int pyemu_gameboy_save_state(const pyemu_system* system, const char* path);
-static int pyemu_gameboy_load_state(pyemu_system* system, const char* path);
+/* Thin vtable adapter that forwards save-state requests into the DMG state module. */
+static int pyemu_gameboy_save_state(const pyemu_system* system, const char* path) {
+    return pyemu_gameboy_save_state_file((const pyemu_gameboy_system*)system, path);
+}
+/* Thin vtable adapter that forwards load-state requests into the DMG state module. */
+static int pyemu_gameboy_load_state(pyemu_system* system, const char* path) {
+    return pyemu_gameboy_load_state_file((pyemu_gameboy_system*)system, path);
+}
 static int pyemu_gameboy_execute_hotpath(pyemu_gameboy_system* gb, int* out_cycles);
 static uint8_t pyemu_gameboy_current_bank_for_address(const pyemu_gameboy_system* gb, uint16_t address);
 static pyemu_block_cache_entry* pyemu_gameboy_get_block_cache_entry(pyemu_gameboy_system* gb, uint16_t pc, uint8_t bank);
@@ -15,596 +23,24 @@ static int pyemu_gameboy_decode_block(pyemu_gameboy_system* gb, pyemu_block_cach
 static int pyemu_gameboy_execute_block(pyemu_gameboy_system* gb, const pyemu_block_cache_entry* entry, int* out_cycles);
 static int pyemu_gameboy_execute_opcode(pyemu_gameboy_system* gb, uint8_t opcode);
 static const char* pyemu_gameboy_name(const pyemu_system* system);
-static void pyemu_gameboy_reset(pyemu_system* system);
-static int pyemu_gameboy_load_rom(pyemu_system* system, const char* path);
-static void pyemu_gameboy_step_instruction(pyemu_system* system);
-static void pyemu_gameboy_step_frame(pyemu_system* system);
-static void pyemu_gameboy_destroy(pyemu_system* system);
-
-static int pyemu_gameboy_is_tracked_access(uint16_t address) {
-    if (address < 0x8000) {
-        return 1;
-    }
-    if ((address >= 0x8000 && address <= 0x9FFF) || (address >= 0xFE00 && address <= 0xFE9F)) {
-        return 1;
-    }
-    return address >= 0xFF00;
-}
-
-static void pyemu_gameboy_record_access(pyemu_gameboy_system* gb, uint16_t address, uint8_t value, int is_write) {
-    if (!gb->bus_tracking_enabled || !pyemu_gameboy_is_tracked_access(address)) {
-        return;
-    }
-    gb->last_access.address = address;
-    gb->last_access.value = value;
-    gb->last_access.is_write = (uint8_t)(is_write ? 1 : 0);
-    gb->last_access.valid = 1;
-    if (is_write && address < 0x8000) {
-        gb->last_mapper_access = gb->last_access;
-    }
-}
-
-static void pyemu_gameboy_sync_memory(pyemu_gameboy_system* gb) {
-    pyemu_gameboy_refresh_rom_mapping(gb);
-    memcpy(gb->memory + 0x0000, gb->rom_bank0, sizeof(gb->rom_bank0));
-    memcpy(gb->memory + 0x4000, gb->rom_bankx, sizeof(gb->rom_bankx));
-    memcpy(gb->memory + 0x8000, gb->vram, sizeof(gb->vram));
-    pyemu_gameboy_refresh_eram_window(gb);
-    memcpy(gb->memory + 0xC000, gb->wram, sizeof(gb->wram));
-    memcpy(gb->memory + 0xE000, gb->wram, sizeof(gb->wram));
-    memcpy(gb->memory + 0xFF80, gb->hram, sizeof(gb->hram));
-}
-
-uint8_t pyemu_gameboy_peek_memory(const pyemu_gameboy_system* gb, uint16_t address) {
-    if (address == 0xFF00) {
-        return pyemu_gameboy_current_joypad_value(gb);
-    }
-    if (address >= 0xA000 && address <= 0xBFFF) {
-        if (!gb->ram_enabled || !pyemu_gameboy_has_external_ram(gb)) {
-            return 0xFF;
-        }
-        size_t offset = pyemu_gameboy_current_eram_offset(gb) + (size_t)(address - 0xA000);
-        return offset < gb->eram_size ? gb->eram[offset] : 0xFF;
-    }
-    return gb->memory[address];
-}
-
-uint8_t pyemu_gameboy_read_memory(const pyemu_gameboy_system* gb, uint16_t address) {
-    uint8_t value;
-
-    if (address >= 0x8000 && address <= 0x9FFF && !pyemu_gameboy_cpu_can_access_vram(gb)) {
-        value = 0xFF;
-    } else if (address >= 0xFE00 && address <= 0xFE9F && !pyemu_gameboy_cpu_can_access_oam(gb)) {
-        value = 0xFF;
-    } else {
-        value = pyemu_gameboy_peek_memory(gb, address);
-    }
-
-    pyemu_gameboy_record_access((pyemu_gameboy_system*)gb, address, value, 0);
-    return value;
-}
-
-/*
- * All CPU-visible writes funnel through this helper so mapper changes, IO side
- * effects, save-RAM updates and LCD access restrictions stay centralized.
- */
-void pyemu_gameboy_write_memory(pyemu_gameboy_system* gb, uint16_t address, uint8_t value) {
-    if (address < 0x8000) {
-        pyemu_gameboy_record_access(gb, address, value, 1);
-        if (address <= 0x1FFF) {
-            if (pyemu_gameboy_uses_mbc1(gb) || pyemu_gameboy_uses_mbc3(gb)) {
-                gb->ram_enabled = ((value & 0x0F) == 0x0A) ? 1 : 0;
-            }
-        } else if (address <= 0x3FFF) {
-            if (pyemu_gameboy_uses_mbc1(gb)) {
-                gb->mbc1_rom_bank = pyemu_gameboy_normalize_mbc1_bank(gb, value);
-            } else if (pyemu_gameboy_uses_mbc3(gb)) {
-                gb->mbc3_rom_bank = (uint8_t)(value & 0x7F);
-                if (gb->mbc3_rom_bank == 0) {
-                    gb->mbc3_rom_bank = 1;
-                }
-            }
-            pyemu_gameboy_refresh_rom_mapping(gb);
-            memcpy(gb->memory + 0x0000, gb->rom_bank0, sizeof(gb->rom_bank0));
-            memcpy(gb->memory + 0x4000, gb->rom_bankx, sizeof(gb->rom_bankx));
-        } else if (address <= 0x5FFF) {
-            if (pyemu_gameboy_uses_mbc1(gb)) {
-                gb->mbc3_ram_bank = (uint8_t)(value & 0x03);
-                pyemu_gameboy_refresh_rom_mapping(gb);
-                memcpy(gb->memory + 0x0000, gb->rom_bank0, sizeof(gb->rom_bank0));
-                memcpy(gb->memory + 0x4000, gb->rom_bankx, sizeof(gb->rom_bankx));
-                pyemu_gameboy_refresh_eram_window(gb);
-            } else if (pyemu_gameboy_uses_mbc3(gb) && gb->eram_bank_count > 0) {
-                gb->mbc3_ram_bank = (uint8_t)(value & 0x03);
-                pyemu_gameboy_refresh_eram_window(gb);
-            }
-        } else if (address <= 0x7FFF) {
-            if (pyemu_gameboy_uses_mbc1(gb)) {
-                gb->mbc3_rom_bank = (uint8_t)(value & 0x01);
-                pyemu_gameboy_refresh_rom_mapping(gb);
-                memcpy(gb->memory + 0x0000, gb->rom_bank0, sizeof(gb->rom_bank0));
-                memcpy(gb->memory + 0x4000, gb->rom_bankx, sizeof(gb->rom_bankx));
-                pyemu_gameboy_refresh_eram_window(gb);
-            }
-        }
-        return;
-    }
-
-    if (address >= 0x8000 && address <= 0x9FFF) {
-        pyemu_gameboy_record_access(gb, address, value, 1);
-        if (!pyemu_gameboy_cpu_can_access_vram(gb)) {
-            return;
-        }
-        gb->memory[address] = value;
-        gb->vram[address - 0x8000] = value;
-        return;
-    }
-
-    if (address >= 0xFE00 && address <= 0xFE9F) {
-        pyemu_gameboy_record_access(gb, address, value, 1);
-        if (!pyemu_gameboy_cpu_can_access_oam(gb)) {
-            return;
-        }
-        gb->memory[address] = value;
-        return;
-    }
-
-    if (address >= 0xA000 && address <= 0xBFFF) {
-        if (gb->ram_enabled && pyemu_gameboy_has_external_ram(gb)) {
-            size_t offset = pyemu_gameboy_current_eram_offset(gb) + (size_t)(address - 0xA000);
-            if (offset < gb->eram_size) {
-                gb->eram[offset] = value;
-                gb->memory[address] = value;
-                gb->battery_dirty = 1;
-            }
-        }
-        pyemu_gameboy_record_access(gb, address, value, 1);
-        return;
-    }
-
-    if (address == 0xFF00) {
-        uint8_t previous_value = pyemu_gameboy_current_joypad_value(gb);
-        gb->memory[address] = (uint8_t)(0xC0 | (value & 0x30) | 0x0F);
-        pyemu_gameboy_refresh_joypad(gb, previous_value);
-        pyemu_gameboy_record_access(gb, address, gb->memory[address], 1);
-        pyemu_gameboy_apu_handle_write(gb, address, gb->memory[address]);
-        return;
-    }
-    if (address == PYEMU_IO_DIV) {
-        int old_signal = pyemu_gameboy_timer_signal(gb);
-        gb->div_counter = 0;
-        gb->memory[address] = 0;
-        pyemu_gameboy_apply_timer_edge(gb, old_signal, pyemu_gameboy_timer_signal(gb));
-        pyemu_gameboy_record_access(gb, address, 0, 1);
-        return;
-    }
-    if (address == PYEMU_IO_LY) {
-        gb->ppu_counter = 0;
-        gb->memory[address] = 0;
-        pyemu_gameboy_update_stat(gb);
-        pyemu_gameboy_record_access(gb, address, 0, 1);
-        return;
-    }
-    if (address == PYEMU_IO_TAC) {
-        int old_signal = pyemu_gameboy_timer_signal(gb);
-        gb->memory[address] = (uint8_t)(value & 0x07);
-        pyemu_gameboy_apply_timer_edge(gb, old_signal, pyemu_gameboy_timer_signal(gb));
-        pyemu_gameboy_record_access(gb, address, gb->memory[address], 1);
-        return;
-    }
-    if (address == PYEMU_IO_IF) {
-        gb->memory[address] = (uint8_t)(0xE0 | (value & 0x1F));
-        pyemu_gameboy_record_access(gb, address, gb->memory[address], 1);
-        return;
-    }
-    if (address == PYEMU_IO_STAT) {
-        gb->memory[address] = (uint8_t)((value & 0x78) | (gb->memory[address] & 0x07));
-        pyemu_gameboy_update_stat(gb);
-        pyemu_gameboy_record_access(gb, address, gb->memory[address], 1);
-        return;
-    }
-    if (address == PYEMU_IO_LYC) {
-        gb->memory[address] = value;
-        pyemu_gameboy_update_stat(gb);
-        pyemu_gameboy_record_access(gb, address, gb->memory[address], 1);
-        return;
-    }
-    if (address == PYEMU_IO_LCDC) {
-        uint8_t previous = gb->memory[address];
-        gb->memory[address] = value;
-        if ((previous & 0x80) && !(value & 0x80)) {
-            gb->ppu_counter = 0;
-            gb->memory[PYEMU_IO_LY] = 0;
-            gb->memory[PYEMU_IO_IF] = (uint8_t)(0xE0 | ((gb->memory[PYEMU_IO_IF] & (uint8_t)~(PYEMU_INTERRUPT_VBLANK | PYEMU_INTERRUPT_LCD)) & 0x1F));
-            gb->stat_irq_line = 0;
-            gb->stat_mode = 0;
-            gb->stat_coincidence = 0;
-        } else if (!(previous & 0x80) && (value & 0x80)) {
-            gb->ppu_counter = 0;
-            gb->memory[PYEMU_IO_LY] = 0;
-            gb->stat_irq_line = 0;
-            gb->stat_mode = 2;
-            gb->stat_coincidence = 0;
-        }
-        pyemu_gameboy_update_stat(gb);
-        pyemu_gameboy_record_access(gb, address, value, 1);
-        return;
-    }
-    if (address == PYEMU_IO_DMA) {
-        uint16_t source = (uint16_t)(value << 8);
-        uint16_t index;
-        gb->memory[address] = value;
-        pyemu_gameboy_record_access(gb, address, value, 1);
-        for (index = 0; index < PYEMU_GAMEBOY_OAM_SIZE; ++index) {
-            gb->memory[0xFE00 + index] = pyemu_gameboy_read_memory(gb, (uint16_t)(source + index));
-            pyemu_gameboy_record_access(gb, (uint16_t)(0xFE00 + index), gb->memory[0xFE00 + index], 1);
-        }
-        return;
-    }
-
-    gb->memory[address] = value;
-    pyemu_gameboy_record_access(gb, address, value, 1);
-    pyemu_gameboy_apu_handle_write(gb, address, value);
-
-    if (address >= 0xC000 && address <= 0xDFFF) {
-        gb->wram[address - 0xC000] = value;
-        if (address <= 0xDDFF) {
-            gb->memory[address + 0x2000] = value;
-        }
-    } else if (address >= 0xE000 && address <= 0xFDFF) {
-        if (address <= 0xFDFF) {
-            gb->wram[address - 0xE000] = value;
-        }
-        if (address <= 0xFDFF && address - 0x2000 <= 0xDDFF) {
-            gb->memory[address - 0x2000] = value;
-        }
-    } else if (address >= 0xFF80 && address <= 0xFFFE) {
-        gb->hram[address - 0xFF80] = value;
-    }
-}
-
-static void pyemu_gameboy_extract_title(pyemu_gameboy_system* gb) {
-    size_t title_length = 0;
-    size_t index;
-
-    memset(gb->cartridge_title, 0, sizeof(gb->cartridge_title));
-    for (index = PYEMU_GAMEBOY_TITLE_START; index <= PYEMU_GAMEBOY_TITLE_END; ++index) {
-        uint8_t value = gb->rom_bank0[index];
-        if (value == 0) {
-            break;
-        }
-        if (title_length + 1 >= sizeof(gb->cartridge_title)) {
-            break;
-        }
-        gb->cartridge_title[title_length] = (char)value;
-        title_length += 1;
-    }
-
-    if (title_length == 0) {
-        strncpy(gb->cartridge_title, "Unknown", sizeof(gb->cartridge_title) - 1);
-    }
-}
-
-static void pyemu_gameboy_set_post_boot_state(pyemu_gameboy_system* gb) {
-    pyemu_gameboy_set_af(gb, 0x01B0);
-    pyemu_gameboy_set_bc(gb, 0x0013);
-    pyemu_gameboy_set_de(gb, 0x00D8);
-    pyemu_gameboy_set_hl(gb, 0x014D);
-    gb->cpu.sp = 0xFFFE;
-    gb->cpu.pc = 0x0100;
-    gb->cpu.halted = 0;
-    gb->faulted = 0;
-    gb->ime = 0;
-    gb->ime_pending = 0;
-    gb->cycle_count = 0;
-    gb->div_counter = 0;
-    gb->timer_counter = 0;
-    gb->ppu_counter = 0;
-    gb->joypad_buttons = 0x0F;
-    gb->joypad_directions = 0x0F;
-    gb->ram_enabled = 0;
-
-    gb->memory[PYEMU_IO_DIV] = 0xAB;
-    pyemu_gameboy_write_memory(gb, 0xFF00, 0xCF);
-    pyemu_gameboy_write_memory(gb, PYEMU_IO_TIMA, 0x00);
-    pyemu_gameboy_write_memory(gb, PYEMU_IO_TMA, 0x00);
-    pyemu_gameboy_write_memory(gb, PYEMU_IO_TAC, 0x00);
-    pyemu_gameboy_write_memory(gb, PYEMU_IO_IF, 0xE1);
-    pyemu_gameboy_write_memory(gb, 0xFF10, 0x80);
-    pyemu_gameboy_write_memory(gb, 0xFF11, 0xBF);
-    pyemu_gameboy_write_memory(gb, 0xFF12, 0xF3);
-    pyemu_gameboy_write_memory(gb, 0xFF14, 0xBF);
-    pyemu_gameboy_write_memory(gb, 0xFF16, 0x3F);
-    pyemu_gameboy_write_memory(gb, 0xFF17, 0x00);
-    pyemu_gameboy_write_memory(gb, 0xFF19, 0xBF);
-    pyemu_gameboy_write_memory(gb, 0xFF1A, 0x7F);
-    pyemu_gameboy_write_memory(gb, 0xFF1B, 0xFF);
-    pyemu_gameboy_write_memory(gb, 0xFF1C, 0x9F);
-    pyemu_gameboy_write_memory(gb, 0xFF1E, 0xBF);
-    pyemu_gameboy_write_memory(gb, 0xFF20, 0xFF);
-    pyemu_gameboy_write_memory(gb, 0xFF21, 0x00);
-    pyemu_gameboy_write_memory(gb, 0xFF22, 0x00);
-    pyemu_gameboy_write_memory(gb, 0xFF23, 0xBF);
-    pyemu_gameboy_write_memory(gb, 0xFF24, 0x77);
-    pyemu_gameboy_write_memory(gb, 0xFF25, 0xF3);
-    pyemu_gameboy_write_memory(gb, 0xFF26, 0xF1);
-    pyemu_gameboy_write_memory(gb, 0xFF40, 0x91);
-    pyemu_gameboy_write_memory(gb, 0xFF41, 0x85);
-    pyemu_gameboy_update_stat(gb);
-    pyemu_gameboy_write_memory(gb, 0xFF42, 0x00);
-    pyemu_gameboy_write_memory(gb, 0xFF43, 0x00);
-    pyemu_gameboy_write_memory(gb, PYEMU_IO_LY, 0x00);
-    pyemu_gameboy_write_memory(gb, 0xFF45, 0x00);
-    pyemu_gameboy_write_memory(gb, 0xFF47, 0xFC);
-    pyemu_gameboy_write_memory(gb, 0xFF48, 0xFF);
-    pyemu_gameboy_write_memory(gb, 0xFF49, 0xFF);
-    pyemu_gameboy_write_memory(gb, 0xFF4A, 0x00);
-    pyemu_gameboy_write_memory(gb, 0xFF4B, 0x00);
-    pyemu_gameboy_write_memory(gb, PYEMU_IO_IE, 0x00);
-}
-
+/* Return the registry key for this core. */
 static const char* pyemu_gameboy_name(const pyemu_system* system) {
     (void)system;
     return "gameboy";
 }
-
+/* Thin vtable adapter that resets the live machine while preserving the loaded cartridge. */
 static void pyemu_gameboy_reset(pyemu_system* system) {
-    pyemu_gameboy_system* gb = (pyemu_gameboy_system*)system;
-    memset(gb->memory, 0, sizeof(gb->memory));
-    memset(gb->frame, 0, sizeof(gb->frame));
-    memset(gb->vram, 0, sizeof(gb->vram));
-    memset(gb->wram, 0, sizeof(gb->wram));
-    memset(gb->hram, 0, sizeof(gb->hram));
-    memset(gb->line_scx, 0, sizeof(gb->line_scx));
-    memset(gb->line_scy, 0, sizeof(gb->line_scy));
-    memset(gb->line_wx, 0, sizeof(gb->line_wx));
-    memset(gb->line_wy, 0, sizeof(gb->line_wy));
-    memset(gb->line_lcdc, 0, sizeof(gb->line_lcdc));
-    memset(gb->line_bgp, 0, sizeof(gb->line_bgp));
-    memset(gb->line_obp0, 0, sizeof(gb->line_obp0));
-    memset(gb->line_obp1, 0, sizeof(gb->line_obp1));
-    memset(gb->block_cache, 0, sizeof(gb->block_cache));
-    memset(&gb->cpu, 0, sizeof(gb->cpu));
-    gb->last_opcode = 0;
-    gb->stat_irq_line = 0;
-    memset(&gb->last_access, 0, sizeof(gb->last_access));
-    memset(&gb->last_mapper_access, 0, sizeof(gb->last_mapper_access));
-    gb->bus_tracking_enabled = 1;
-
-    if (!gb->rom_loaded) {
-        memset(gb->rom_bank0, 0, sizeof(gb->rom_bank0));
-        memset(gb->rom_bankx, 0, sizeof(gb->rom_bankx));
-        memset(gb->loaded_rom, 0, sizeof(gb->loaded_rom));
-        memset(gb->cartridge_title, 0, sizeof(gb->cartridge_title));
-        memset(gb->eram, 0, sizeof(gb->eram));
-        gb->rom_size = 0;
-        gb->rom_bank_count = 0;
-        gb->cartridge_type = 0;
-        gb->ram_size_code = 0;
-        gb->eram_size = 0;
-        gb->eram_bank_count = 0;
-        gb->ram_enabled = 0;
-        gb->mbc1_rom_bank = 1;
-        gb->mbc3_rom_bank = 0;
-        gb->mbc3_ram_bank = 0;
-    } else {
-        gb->ram_enabled = 0;
-        gb->mbc1_rom_bank = 1;
-        gb->mbc3_rom_bank = pyemu_gameboy_uses_mbc1(gb) ? 0 : 1;
-        gb->mbc3_ram_bank = 0;
-    }
-
-    pyemu_gameboy_sync_memory(gb);
-    pyemu_gameboy_set_post_boot_state(gb);
-    pyemu_gameboy_update_demo_frame(gb);
+    pyemu_gameboy_reset_state((pyemu_gameboy_system*)system);
 }
-
+/* Thin vtable adapter that loads a new ROM into this system instance. */
 static int pyemu_gameboy_load_rom(pyemu_system* system, const char* path) {
-    pyemu_gameboy_system* gb = (pyemu_gameboy_system*)system;
-    FILE* rom_file;
-    long file_size;
-    size_t read_size;
-    uint8_t* rom_data;
-
-    if (path == NULL || path[0] == '\0') {
-        return 0;
-    }
-
-    rom_file = fopen(path, "rb");
-    if (rom_file == NULL) {
-        return 0;
-    }
-
-    if (fseek(rom_file, 0, SEEK_END) != 0) {
-        fclose(rom_file);
-        return 0;
-    }
-
-    file_size = ftell(rom_file);
-    if (file_size <= 0 || fseek(rom_file, 0, SEEK_SET) != 0) {
-        fclose(rom_file);
-        return 0;
-    }
-
-    rom_data = (uint8_t*)malloc((size_t)file_size);
-    if (rom_data == NULL) {
-        fclose(rom_file);
-        return 0;
-    }
-
-    read_size = fread(rom_data, 1, (size_t)file_size, rom_file);
-    fclose(rom_file);
-    if (read_size != (size_t)file_size) {
-        free(rom_data);
-        return 0;
-    }
-
-    free(gb->rom_data);
-    gb->rom_data = rom_data;
-    gb->rom_size = (size_t)file_size;
-    gb->rom_bank_count = (gb->rom_size + (PYEMU_GAMEBOY_ROM_BANKX_SIZE - 1)) / PYEMU_GAMEBOY_ROM_BANKX_SIZE;
-    gb->cartridge_type = gb->rom_size > 0x0147 ? gb->rom_data[0x0147] : 0;
-    gb->ram_size_code = gb->rom_size > 0x0149 ? gb->rom_data[0x0149] : 0;
-    gb->eram_size = pyemu_gameboy_eram_size_from_code(gb->ram_size_code);
-    if (gb->eram_size > sizeof(gb->eram)) {
-        gb->eram_size = sizeof(gb->eram);
-    }
-    gb->eram_bank_count = gb->eram_size == 0 ? 0 : ((gb->eram_size + PYEMU_GAMEBOY_ERAM_BANK_SIZE - 1) / PYEMU_GAMEBOY_ERAM_BANK_SIZE);
-    gb->ram_enabled = 0;
-    gb->mbc1_rom_bank = 1;
-    gb->mbc3_rom_bank = pyemu_gameboy_uses_mbc1(gb) ? 0 : 1;
-    gb->mbc3_ram_bank = 0;
-    gb->rom_loaded = 1;
-    strncpy(gb->loaded_rom, path, sizeof(gb->loaded_rom) - 1);
-    gb->loaded_rom[sizeof(gb->loaded_rom) - 1] = '\0';
-    memset(gb->eram, 0, sizeof(gb->eram));
-    pyemu_gameboy_load_battery_ram(gb);
-    pyemu_gameboy_refresh_rom_mapping(gb);
-    pyemu_gameboy_extract_title(gb);
-    pyemu_gameboy_reset(system);
-    return 1;
+    return pyemu_gameboy_load_rom_file((pyemu_gameboy_system*)system, path);
 }
+static void pyemu_gameboy_step_instruction(pyemu_system* system);
+static void pyemu_gameboy_step_frame(pyemu_system* system);
+static void pyemu_gameboy_destroy(pyemu_system* system);
 
-static int pyemu_gameboy_save_state(const pyemu_system* system, const char* path) {
-    const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
-    pyemu_gameboy_state_file snapshot;
-    FILE* state_file;
-
-    if (gb == NULL || !gb->rom_loaded || path == NULL || path[0] == 0) {
-        return 0;
-    }
-
-    memset(&snapshot, 0, sizeof(snapshot));
-    snapshot.magic = PYEMU_GAMEBOY_STATE_MAGIC;
-    snapshot.version = PYEMU_GAMEBOY_STATE_VERSION;
-    snapshot.cpu = gb->cpu;
-    memcpy(snapshot.memory, gb->memory, sizeof(snapshot.memory));
-    memcpy(snapshot.vram, gb->vram, sizeof(snapshot.vram));
-    memcpy(snapshot.wram, gb->wram, sizeof(snapshot.wram));
-    memcpy(snapshot.hram, gb->hram, sizeof(snapshot.hram));
-    memcpy(snapshot.eram, gb->eram, sizeof(snapshot.eram));
-    memcpy(snapshot.line_scx, gb->line_scx, sizeof(snapshot.line_scx));
-    memcpy(snapshot.line_scy, gb->line_scy, sizeof(snapshot.line_scy));
-    memcpy(snapshot.line_wx, gb->line_wx, sizeof(snapshot.line_wx));
-    memcpy(snapshot.line_wy, gb->line_wy, sizeof(snapshot.line_wy));
-    memcpy(snapshot.line_lcdc, gb->line_lcdc, sizeof(snapshot.line_lcdc));
-    memcpy(snapshot.line_bgp, gb->line_bgp, sizeof(snapshot.line_bgp));
-    memcpy(snapshot.line_obp0, gb->line_obp0, sizeof(snapshot.line_obp0));
-    memcpy(snapshot.line_obp1, gb->line_obp1, sizeof(snapshot.line_obp1));
-    memcpy(snapshot.loaded_rom, gb->loaded_rom, sizeof(snapshot.loaded_rom));
-    memcpy(snapshot.cartridge_title, gb->cartridge_title, sizeof(snapshot.cartridge_title));
-    snapshot.rom_size = gb->rom_size;
-    snapshot.rom_bank_count = gb->rom_bank_count;
-    snapshot.rom_loaded = gb->rom_loaded;
-    snapshot.cartridge_type = gb->cartridge_type;
-    snapshot.ram_size_code = gb->ram_size_code;
-    snapshot.eram_size = gb->eram_size;
-    snapshot.eram_bank_count = gb->eram_bank_count;
-    snapshot.ram_enabled = gb->ram_enabled;
-    snapshot.mbc1_rom_bank = gb->mbc1_rom_bank;
-    snapshot.mbc3_rom_bank = gb->mbc3_rom_bank;
-    snapshot.mbc3_ram_bank = gb->mbc3_ram_bank;
-    snapshot.ime = gb->ime;
-    snapshot.ime_pending = gb->ime_pending;
-    snapshot.last_opcode = gb->last_opcode;
-    snapshot.cycle_count = gb->cycle_count;
-    snapshot.div_counter = gb->div_counter;
-    snapshot.timer_counter = gb->timer_counter;
-    snapshot.ppu_counter = gb->ppu_counter;
-    snapshot.joypad_buttons = gb->joypad_buttons;
-    snapshot.joypad_directions = gb->joypad_directions;
-    snapshot.stat_coincidence = gb->stat_coincidence;
-    snapshot.stat_mode = gb->stat_mode;
-    snapshot.last_access = gb->last_access;
-    snapshot.faulted = gb->faulted;
-
-    state_file = fopen(path, "wb");
-    if (state_file == NULL) {
-        return 0;
-    }
-    if (fwrite(&snapshot, sizeof(snapshot), 1, state_file) != 1) {
-        fclose(state_file);
-        return 0;
-    }
-    fclose(state_file);
-    return 1;
-}
-
-static int pyemu_gameboy_load_state(pyemu_system* system, const char* path) {
-    pyemu_gameboy_system* gb = (pyemu_gameboy_system*)system;
-    pyemu_gameboy_state_file snapshot;
-    FILE* state_file;
-
-    if (gb == NULL || !gb->rom_loaded || path == NULL || path[0] == 0) {
-        return 0;
-    }
-
-    state_file = fopen(path, "rb");
-    if (state_file == NULL) {
-        return 0;
-    }
-    if (fread(&snapshot, sizeof(snapshot), 1, state_file) != 1) {
-        fclose(state_file);
-        return 0;
-    }
-    fclose(state_file);
-
-    if (snapshot.magic != PYEMU_GAMEBOY_STATE_MAGIC || snapshot.version != PYEMU_GAMEBOY_STATE_VERSION) {
-        return 0;
-    }
-    if (!snapshot.rom_loaded || strcmp(snapshot.loaded_rom, gb->loaded_rom) != 0 || strcmp(snapshot.cartridge_title, gb->cartridge_title) != 0) {
-        return 0;
-    }
-
-    gb->cpu = snapshot.cpu;
-    memcpy(gb->memory, snapshot.memory, sizeof(gb->memory));
-    memcpy(gb->vram, snapshot.vram, sizeof(gb->vram));
-    memcpy(gb->wram, snapshot.wram, sizeof(gb->wram));
-    memcpy(gb->hram, snapshot.hram, sizeof(gb->hram));
-    memcpy(gb->eram, snapshot.eram, sizeof(gb->eram));
-    memcpy(gb->line_scx, snapshot.line_scx, sizeof(gb->line_scx));
-    memcpy(gb->line_scy, snapshot.line_scy, sizeof(gb->line_scy));
-    memcpy(gb->line_wx, snapshot.line_wx, sizeof(gb->line_wx));
-    memcpy(gb->line_wy, snapshot.line_wy, sizeof(gb->line_wy));
-    memcpy(gb->line_lcdc, snapshot.line_lcdc, sizeof(gb->line_lcdc));
-    memcpy(gb->line_bgp, snapshot.line_bgp, sizeof(gb->line_bgp));
-    memcpy(gb->line_obp0, snapshot.line_obp0, sizeof(gb->line_obp0));
-    memcpy(gb->line_obp1, snapshot.line_obp1, sizeof(gb->line_obp1));
-    gb->rom_size = snapshot.rom_size;
-    gb->rom_bank_count = snapshot.rom_bank_count;
-    gb->rom_loaded = snapshot.rom_loaded;
-    gb->cartridge_type = snapshot.cartridge_type;
-    gb->ram_size_code = snapshot.ram_size_code;
-    gb->eram_size = snapshot.eram_size;
-    gb->eram_bank_count = snapshot.eram_bank_count;
-    gb->ram_enabled = snapshot.ram_enabled;
-    gb->mbc1_rom_bank = snapshot.mbc1_rom_bank;
-    gb->mbc3_rom_bank = snapshot.mbc3_rom_bank;
-    gb->mbc3_ram_bank = snapshot.mbc3_ram_bank;
-    gb->ime = snapshot.ime;
-    gb->ime_pending = snapshot.ime_pending;
-    gb->ime_delay = 0;
-    gb->halt_bug = 0;
-    gb->last_opcode = snapshot.last_opcode;
-    gb->cycle_count = snapshot.cycle_count;
-    gb->div_counter = snapshot.div_counter;
-    gb->timer_counter = snapshot.timer_counter;
-    gb->ppu_counter = snapshot.ppu_counter;
-    gb->joypad_buttons = snapshot.joypad_buttons;
-    gb->joypad_directions = snapshot.joypad_directions;
-    gb->stat_coincidence = snapshot.stat_coincidence;
-    gb->stat_mode = snapshot.stat_mode;
-    gb->stat_irq_line = 0;
-    gb->last_access = snapshot.last_access;
-    memset(&gb->last_mapper_access, 0, sizeof(gb->last_mapper_access));
-    gb->faulted = snapshot.faulted;
-
-    pyemu_gameboy_refresh_rom_mapping(gb);
-    pyemu_gameboy_update_stat(gb);
-    pyemu_gameboy_update_demo_frame(gb);
-    return 1;
-}
-
+/* Main single-instruction fallback executor used when an opcode is not handled by the decoded block hotpath. */
 static int pyemu_gameboy_execute_opcode(pyemu_gameboy_system* gb, uint8_t opcode) {
     int cycles = 4;
     gb->last_opcode = opcode;
@@ -710,6 +146,7 @@ static int pyemu_gameboy_execute_opcode(pyemu_gameboy_system* gb, uint8_t opcode
     return cycles;
 }
 
+/* Resolve which ROM bank currently backs a given code address so the block cache does not cross mapper contexts. */
 static uint8_t pyemu_gameboy_current_bank_for_address(const pyemu_gameboy_system* gb, uint16_t address) {
     if (address < 0x4000) {
         if (pyemu_gameboy_uses_mbc1(gb) && pyemu_gameboy_mbc1_mode(gb)) {
@@ -727,11 +164,13 @@ static uint8_t pyemu_gameboy_current_bank_for_address(const pyemu_gameboy_system
     return 0xFF;
 }
 
+/* Pick the hash-table slot used to cache a decoded basic block for a PC/bank pair. */
 static pyemu_block_cache_entry* pyemu_gameboy_get_block_cache_entry(pyemu_gameboy_system* gb, uint16_t pc, uint8_t bank) {
     uint32_t index = ((((uint32_t)bank) << 16) ^ pc) & (PYEMU_GAMEBOY_BLOCK_CACHE_SIZE - 1);
     return &gb->block_cache[index];
 }
 
+/* Decode a short straight-line ROM block into the lightweight cached instruction format used by the hotpath executor. */
 static int pyemu_gameboy_decode_block(pyemu_gameboy_system* gb, pyemu_block_cache_entry* entry, uint16_t pc, uint8_t bank) {
     uint16_t cursor = pc;
     uint8_t count = 0;
@@ -821,6 +260,7 @@ static int pyemu_gameboy_decode_block(pyemu_gameboy_system* gb, pyemu_block_cach
     return entry->valid;
 }
 
+/* Execute a previously decoded block and report the total cycles consumed. */
 static int pyemu_gameboy_execute_block(pyemu_gameboy_system* gb, const pyemu_block_cache_entry* entry, int* out_cycles) {
     int cycles = 0;
     uint8_t index;
@@ -889,6 +329,7 @@ static int pyemu_gameboy_execute_block(pyemu_gameboy_system* gb, const pyemu_blo
     return 1;
 }
 
+/* Try to run the current PC through the ROM block cache before falling back to the full interpreter. */
 static int pyemu_gameboy_execute_hotpath(pyemu_gameboy_system* gb, int* out_cycles) {
     uint16_t pc = gb->cpu.pc;
 
@@ -992,6 +433,7 @@ static int pyemu_gameboy_execute_hotpath(pyemu_gameboy_system* gb, int* out_cycl
     return 0;
 }
 
+/* Core execution step used by both debugger stepping and frame-running paths. */
 static void pyemu_gameboy_step_instruction_internal(pyemu_gameboy_system* gb, int render_frame) {
     uint8_t opcode;
     int cycles;
@@ -1081,11 +523,13 @@ static void pyemu_gameboy_step_instruction_internal(pyemu_gameboy_system* gb, in
     }
 }
 
+/* Vtable entry for single-instruction stepping. */
 static void pyemu_gameboy_step_instruction(pyemu_system* system) {
     pyemu_gameboy_system* gb = (pyemu_gameboy_system*)system;
     pyemu_gameboy_step_instruction_internal(gb, 1);
 }
 
+/* Vtable entry that advances the emulator until a full video frame has elapsed. */
 static void pyemu_gameboy_step_frame(pyemu_system* system) {
     pyemu_gameboy_system* gb = (pyemu_gameboy_system*)system;
     uint64_t target_cycles = gb->cycle_count + PYEMU_GAMEBOY_CYCLES_PER_FRAME;
@@ -1119,6 +563,7 @@ static void pyemu_gameboy_step_frame(pyemu_system* system) {
     pyemu_gameboy_update_audio_frame(gb);
 }
 
+/* Release heap-owned cartridge data and flush battery RAM before destroying the core instance. */
 static void pyemu_gameboy_destroy(pyemu_system* system) {
     pyemu_gameboy_system* gb = (pyemu_gameboy_system*)system;
     if (gb != NULL) {
@@ -1130,6 +575,7 @@ static void pyemu_gameboy_destroy(pyemu_system* system) {
     free(system);
 }
 
+/* Export the current CPU register snapshot to the debugger/runtime layer. */
 static void pyemu_gameboy_get_cpu_state(const pyemu_system* system, pyemu_cpu_state* out_state) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     if (out_state != NULL) {
@@ -1138,6 +584,7 @@ static void pyemu_gameboy_get_cpu_state(const pyemu_system* system, pyemu_cpu_st
     }
 }
 
+/* Export the most recently rendered RGBA framebuffer. */
 static void pyemu_gameboy_get_frame_buffer(const pyemu_system* system, pyemu_frame_buffer* out_frame) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     if (out_frame == NULL) {
@@ -1149,6 +596,7 @@ static void pyemu_gameboy_get_frame_buffer(const pyemu_system* system, pyemu_fra
     out_frame->rgba_size = PYEMU_GAMEBOY_RGBA_SIZE;
 }
 
+/* Export the flat 64K memory image used by debugger views. */
 static const uint8_t* pyemu_gameboy_get_memory(const pyemu_system* system, size_t* size) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     if (size != NULL) {
@@ -1157,6 +605,7 @@ static const uint8_t* pyemu_gameboy_get_memory(const pyemu_system* system, size_
     return gb->memory;
 }
 
+/* Vtable hook used by cheats and debugger memory editing. */
 static void pyemu_gameboy_poke_memory(pyemu_system* system, uint16_t address, uint8_t value) {
     pyemu_gameboy_system* gb = (pyemu_gameboy_system*)system;
     if (gb == NULL) {
@@ -1165,6 +614,7 @@ static void pyemu_gameboy_poke_memory(pyemu_system* system, uint16_t address, ui
     pyemu_gameboy_write_memory(gb, address, value);
 }
 
+/* Vtable hook for side-effect-free debugger memory reads. */
 static uint8_t pyemu_gameboy_peek_memory_vtable(pyemu_system* system, uint16_t address) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     if (gb == NULL) {
@@ -1173,26 +623,31 @@ static uint8_t pyemu_gameboy_peek_memory_vtable(pyemu_system* system, uint16_t a
     return pyemu_gameboy_peek_memory(gb, address);
 }
 
+/* Report whether this system instance currently has cartridge media loaded. */
 static int pyemu_gameboy_has_rom_loaded(const pyemu_system* system) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     return gb->rom_loaded;
 }
 
+/* Return the path of the currently loaded ROM, if any. */
 static const char* pyemu_gameboy_get_rom_path(const pyemu_system* system) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     return gb->loaded_rom;
 }
 
+/* Return the parsed cartridge title for UI and debugger display. */
 static const char* pyemu_gameboy_get_cartridge_title(const pyemu_system* system) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     return gb->cartridge_title;
 }
 
+/* Return the byte size of the currently loaded ROM image. */
 static size_t pyemu_gameboy_get_rom_size(const pyemu_system* system) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     return gb->rom_size;
 }
 
+/* Export the most recent tracked bus access for debugger hardware panels. */
 static void pyemu_gameboy_get_last_bus_access(const pyemu_system* system, pyemu_last_bus_access* out_access) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     if (out_access != NULL) {
@@ -1200,6 +655,7 @@ static void pyemu_gameboy_get_last_bus_access(const pyemu_system* system, pyemu_
     }
 }
 
+/* Export mapper and external-RAM status for debugger inspection. */
 static void pyemu_gameboy_get_cartridge_debug_info(const pyemu_system* system, pyemu_cartridge_debug_info* out_info) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
 
@@ -1224,11 +680,13 @@ static void pyemu_gameboy_get_cartridge_debug_info(const pyemu_system* system, p
     out_info->ram_bank_count = (uint32_t)gb->eram_bank_count;
 }
 
+/* Return the cumulative machine cycle counter. */
 static uint64_t pyemu_gameboy_get_cycle_count(const pyemu_system* system) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     return gb->cycle_count;
 }
 
+/* Report whether execution stopped on an unsupported or invalid path. */
 static int pyemu_gameboy_is_faulted(const pyemu_system* system) {
     const pyemu_gameboy_system* gb = (const pyemu_gameboy_system*)system;
     return gb->faulted;
@@ -1259,6 +717,7 @@ static const pyemu_system_vtable pyemu_gameboy_vtable = {
     pyemu_gameboy_is_faulted
 };
 
+/* Allocate and initialize a new DMG core instance, then wire its vtable. */
 pyemu_system* pyemu_gameboy_create(void) {
     pyemu_gameboy_system* gb = (pyemu_gameboy_system*)calloc(1, sizeof(pyemu_gameboy_system));
     if (gb == NULL) {

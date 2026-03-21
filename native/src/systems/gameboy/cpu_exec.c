@@ -1,5 +1,8 @@
 #include "gameboy_internal.h"
 
+/* Opcode-family helpers for the DMG CPU. The top-level executor delegates here so large instruction groups stay isolated and reusable across other LR35902-style cores. */
+
+/* Decode the compact r8 register index used by many opcodes, including the (HL) pseudo-register. */
 uint8_t pyemu_gameboy_read_r8(pyemu_gameboy_system* gb, int index) {
     switch (index & 0x07) {
         case 0: return gb->cpu.b;
@@ -13,6 +16,7 @@ uint8_t pyemu_gameboy_read_r8(pyemu_gameboy_system* gb, int index) {
     }
 }
 
+/* Write through the compact r8 register index used by many opcodes, including the (HL) pseudo-register. */
 void pyemu_gameboy_write_r8(pyemu_gameboy_system* gb, int index, uint8_t value) {
     switch (index & 0x07) {
         case 0: gb->cpu.b = value; break;
@@ -26,6 +30,7 @@ void pyemu_gameboy_write_r8(pyemu_gameboy_system* gb, int index, uint8_t value) 
     }
 }
 
+/* Execute the CB-prefixed rotate/shift/bit instruction family. */
 int pyemu_gameboy_execute_cb(pyemu_gameboy_system* gb) {
     uint8_t cb_opcode = pyemu_gameboy_fetch_u8(gb);
     int reg_index = cb_opcode & 0x07;
@@ -96,6 +101,7 @@ int pyemu_gameboy_execute_cb(pyemu_gameboy_system* gb) {
     return cycles;
 }
 
+/* Handle the load/store, 16-bit register, and closely related misc instructions that form the bulk of DMG setup code. */
 int pyemu_gameboy_execute_load_store(pyemu_gameboy_system* gb, uint8_t opcode) {
     switch (opcode) {
         case 0x01:
@@ -402,6 +408,7 @@ int pyemu_gameboy_execute_load_store(pyemu_gameboy_system* gb, uint8_t opcode) {
     }
 }
 
+/* Execute jump, call, return, restart, and stack-manipulation opcodes. */
 int pyemu_gameboy_execute_control_flow(pyemu_gameboy_system* gb, uint8_t opcode) {
     switch (opcode) {
         case 0xC0:
@@ -560,6 +567,7 @@ int pyemu_gameboy_execute_control_flow(pyemu_gameboy_system* gb, uint8_t opcode)
     }
 }
 
+/* Execute arithmetic and logic opcodes, including the immediate ALU family. */
 int pyemu_gameboy_execute_alu(pyemu_gameboy_system* gb, uint8_t opcode) {
     switch (opcode) {
         case 0x80: pyemu_gameboy_add_a(gb, gb->cpu.b, 0); return 4;

@@ -1,5 +1,8 @@
 #include "gameboy_internal.h"
 
+/* CPU fetch, stack, and interrupt plumbing shared by the opcode engine and hotpath executor. */
+
+/* Fetch the next opcode/immediate byte, including the DMG halt-bug PC quirk. */
 uint8_t pyemu_gameboy_fetch_u8(pyemu_gameboy_system* gb) {
     uint8_t value = pyemu_gameboy_peek_memory(gb, gb->cpu.pc);
     if (gb->halt_bug) {
@@ -10,12 +13,14 @@ uint8_t pyemu_gameboy_fetch_u8(pyemu_gameboy_system* gb) {
     return value;
 }
 
+/* Fetch a little-endian 16-bit immediate using the same PC rules as byte fetches. */
 uint16_t pyemu_gameboy_fetch_u16(pyemu_gameboy_system* gb) {
     uint8_t low = pyemu_gameboy_fetch_u8(gb);
     uint8_t high = pyemu_gameboy_fetch_u8(gb);
     return (uint16_t)(low | ((uint16_t)high << 8));
 }
 
+/* Push a 16-bit value to the emulated stack in LR35902 byte order. */
 void pyemu_gameboy_push_u16(pyemu_gameboy_system* gb, uint16_t value) {
     gb->cpu.sp = (uint16_t)(gb->cpu.sp - 1);
     pyemu_gameboy_write_memory(gb, gb->cpu.sp, (uint8_t)(value >> 8));
@@ -23,6 +28,7 @@ void pyemu_gameboy_push_u16(pyemu_gameboy_system* gb, uint16_t value) {
     pyemu_gameboy_write_memory(gb, gb->cpu.sp, (uint8_t)(value & 0xFF));
 }
 
+/* Pop a 16-bit value from the emulated stack in LR35902 byte order. */
 uint16_t pyemu_gameboy_pop_u16(pyemu_gameboy_system* gb) {
     uint8_t low = pyemu_gameboy_read_memory(gb, gb->cpu.sp);
     uint8_t high;
@@ -32,10 +38,12 @@ uint16_t pyemu_gameboy_pop_u16(pyemu_gameboy_system* gb) {
     return (uint16_t)(low | ((uint16_t)high << 8));
 }
 
+/* Raise one or more interrupt request bits in IF while preserving the unused high bits. */
 void pyemu_gameboy_request_interrupt(pyemu_gameboy_system* gb, uint8_t mask) {
     gb->memory[PYEMU_IO_IF] = (uint8_t)(0xE0 | ((gb->memory[PYEMU_IO_IF] | mask) & 0x1F));
 }
 
+/* Service the highest-priority pending interrupt, including HALT wakeup and vector dispatch timing. */
 int pyemu_gameboy_service_interrupts(pyemu_gameboy_system* gb) {
     uint8_t pending = pyemu_gameboy_pending_interrupts(gb);
     uint8_t mask = 0;
