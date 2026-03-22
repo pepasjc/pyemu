@@ -13,7 +13,7 @@ static uint8_t pyemu_gbc_normalize_wram_bank(uint8_t value) {
 static void pyemu_gbc_run_hdma(pyemu_gbc_system* gbc, uint8_t value) {
     uint16_t source = (uint16_t)(((uint16_t)gbc->memory[PYEMU_GBC_HDMA1] << 8) | (gbc->memory[PYEMU_GBC_HDMA2] & 0xF0));
     uint16_t dest = (uint16_t)(0x8000 | (((uint16_t)gbc->memory[PYEMU_GBC_HDMA3] & 0x1F) << 8) | (gbc->memory[PYEMU_GBC_HDMA4] & 0xF0));
-    uint16_t length = (uint16_t)((((value & 0x7F) + 1) & 0x7F) * 0x10);
+    uint16_t length = (uint16_t)(((value & 0x7F) + 1) * 0x10);
     uint16_t index;
 
     for (index = 0; index < length; ++index) {
@@ -178,6 +178,7 @@ void pyemu_gbc_write_memory(pyemu_gbc_system* gbc, uint16_t address, uint8_t val
         if (address <= 0x1FFF) {
             if (pyemu_gbc_uses_mbc1(gbc) || pyemu_gbc_uses_mbc3(gbc) || pyemu_gbc_uses_mbc5(gbc)) {
                 gbc->ram_enabled = ((value & 0x0F) == 0x0A) ? 1 : 0;
+                pyemu_gbc_refresh_eram_window(gbc);
             }
         } else if (address <= 0x2FFF) {
             if (pyemu_gbc_uses_mbc1(gbc)) {
@@ -780,6 +781,10 @@ static int pyemu_gbc_save_state(const pyemu_system* system, const char* path) {
     memcpy(snapshot.bg_palettes, gbc->bg_palettes, sizeof(snapshot.bg_palettes));
     memcpy(snapshot.sp_palettes, gbc->sp_palettes, sizeof(snapshot.sp_palettes));
     snapshot.current_vbk = gbc->current_vbk;
+    snapshot.current_wram_bank = gbc->current_wram_bank;
+    snapshot.bg_palette_index = gbc->bg_palette_index;
+    snapshot.sp_palette_index = gbc->sp_palette_index;
+    snapshot.ime_delay = gbc->ime_delay;
     memcpy(snapshot.loaded_rom, gbc->loaded_rom, sizeof(snapshot.loaded_rom));
     memcpy(snapshot.cartridge_title, gbc->cartridge_title, sizeof(snapshot.cartridge_title));
     snapshot.rom_size = gbc->rom_size;
@@ -804,6 +809,7 @@ static int pyemu_gbc_save_state(const pyemu_system* system, const char* path) {
     snapshot.joypad_directions = gbc->joypad_directions;
     snapshot.stat_coincidence = gbc->stat_coincidence;
     snapshot.stat_mode = gbc->stat_mode;
+    snapshot.stat_irq_line = gbc->stat_irq_line;
     snapshot.last_access = gbc->last_access;
     snapshot.double_speed = gbc->double_speed;
     snapshot.faulted = gbc->faulted;
@@ -879,6 +885,10 @@ static int pyemu_gbc_load_state(pyemu_system* system, const char* path) {
     memcpy(gbc->sp_palettes, snapshot.sp_palettes, sizeof(gbc->sp_palettes));
     gbc->current_vbk = snapshot.current_vbk;
     gbc->current_wram_bank = snapshot.current_wram_bank == 0 ? 1 : snapshot.current_wram_bank;
+    gbc->bg_palette_index = snapshot.bg_palette_index;
+    gbc->sp_palette_index = snapshot.sp_palette_index;
+    gbc->memory[PYEMU_GBC_BG_PALETTE_INDEX] = snapshot.bg_palette_index;
+    gbc->memory[PYEMU_GBC_SPRITE_PALETTE_INDEX] = snapshot.sp_palette_index;
     gbc->rom_size = snapshot.rom_size;
     gbc->rom_bank_count = snapshot.rom_bank_count;
     gbc->rom_loaded = snapshot.rom_loaded;
@@ -892,7 +902,7 @@ static int pyemu_gbc_load_state(pyemu_system* system, const char* path) {
     gbc->mbc3_ram_bank = snapshot.mbc3_ram_bank;
     gbc->ime = snapshot.ime;
     gbc->ime_pending = snapshot.ime_pending;
-    gbc->ime_delay = 0;
+    gbc->ime_delay = snapshot.ime_delay;
     gbc->halt_bug = 0;
     gbc->last_opcode = snapshot.last_opcode;
     gbc->cycle_count = snapshot.cycle_count;
@@ -903,7 +913,7 @@ static int pyemu_gbc_load_state(pyemu_system* system, const char* path) {
     gbc->joypad_directions = snapshot.joypad_directions;
     gbc->stat_coincidence = snapshot.stat_coincidence;
     gbc->stat_mode = snapshot.stat_mode;
-    gbc->stat_irq_line = 0;
+    gbc->stat_irq_line = snapshot.stat_irq_line;
     gbc->last_access = snapshot.last_access;
     memset(&gbc->last_mapper_access, 0, sizeof(gbc->last_mapper_access));
     gbc->double_speed = snapshot.double_speed;
@@ -1443,12 +1453,16 @@ static void pyemu_gbc_step_frame(pyemu_system* system) {
         if (gbc->cpu.halted && !gbc->faulted && pending_interrupts == 0 && enabled_interrupts == PYEMU_INTERRUPT_VBLANK) {
             uint32_t skip_cycles = pyemu_gbc_cycles_until_vblank(gbc);
             if (skip_cycles > 4U) {
-                if ((gbc->memory[PYEMU_IO_TAC] & 0x04) == 0 && (uint64_t)skip_cycles <= remaining_cycles) {
+                /* skip_cycles is in PPU (single-speed) units; remaining_cycles is in ticks
+                   (2x in double speed). Convert for comparison. */
+                uint64_t skip_ticks = gbc->double_speed ? (uint64_t)skip_cycles * 2 : (uint64_t)skip_cycles;
+                if ((gbc->memory[PYEMU_IO_TAC] & 0x04) == 0 && skip_ticks <= remaining_cycles) {
                     pyemu_gbc_fast_forward_to_vblank(gbc);
                     continue;
                 }
-                if ((uint64_t)skip_cycles > remaining_cycles) {
-                    skip_cycles = (uint32_t)remaining_cycles;
+                if (skip_ticks > remaining_cycles) {
+                    /* Clamp to remaining PPU cycles */
+                    skip_cycles = gbc->double_speed ? (uint32_t)(remaining_cycles / 2) : (uint32_t)remaining_cycles;
                 }
                 pyemu_gbc_tick(gbc, (int)skip_cycles);
                 continue;

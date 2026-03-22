@@ -39,6 +39,86 @@ static uint8_t pyemu_gbc_wave_sample(const pyemu_gbc_system* gbc, float phase) {
     return (uint8_t)(packed & 0x0F);
 }
 
+/* Advance pulse channel envelope state for one frame (both channels). */
+static void pyemu_gbc_update_pulse_envelope(pyemu_gbc_pulse_channel* pulse) {
+    if (!pulse->enabled || pulse->envelope_period == 0) {
+        return;
+    }
+    /* Envelope ticks at 64 Hz = every 65536 cycles at 4 MHz */
+    pulse->envelope_cycles += PYEMU_GBC_CYCLES_PER_FRAME;
+    while (pulse->envelope_cycles >= 65536U) {
+        pulse->envelope_cycles -= 65536U;
+        if (pulse->envelope_increase) {
+            if (pulse->volume < 15) {
+                pulse->volume = (uint8_t)(pulse->volume + 1u);
+            }
+        } else {
+            if (pulse->volume > 0) {
+                pulse->volume = (uint8_t)(pulse->volume - 1u);
+                if (pulse->volume == 0) {
+                    pulse->enabled = 0;
+                }
+            }
+        }
+    }
+}
+
+/* Advance channel 1 sweep state for one frame. */
+static void pyemu_gbc_update_pulse1_sweep(pyemu_gbc_system* gbc) {
+    pyemu_gbc_pulse_channel* pulse = &gbc->pulse1;
+    uint8_t nr10;
+    uint8_t period;
+    uint8_t shift;
+    uint16_t new_freq;
+
+    if (!pulse->enabled || !pulse->sweep_enabled) {
+        return;
+    }
+    /* Sweep ticks at 128 Hz = every 32768 cycles at 4 MHz */
+    pulse->sweep_cycles += PYEMU_GBC_CYCLES_PER_FRAME;
+    while (pulse->sweep_cycles >= 32768U && pulse->enabled) {
+        pulse->sweep_cycles -= 32768U;
+        if (pulse->sweep_timer > 0) {
+            pulse->sweep_timer = (uint8_t)(pulse->sweep_timer - 1u);
+        }
+        if (pulse->sweep_timer != 0) {
+            continue;
+        }
+        nr10 = gbc->memory[0xFF10];
+        period = (uint8_t)((nr10 >> 4) & 0x07);
+        shift  = (uint8_t)(nr10 & 0x07);
+        pulse->sweep_timer = period ? period : 8u;
+
+        if (period != 0) {
+            if (nr10 & 0x08) {
+                new_freq = (uint16_t)(pulse->sweep_shadow_freq - (pulse->sweep_shadow_freq >> shift));
+            } else {
+                new_freq = (uint16_t)(pulse->sweep_shadow_freq + (pulse->sweep_shadow_freq >> shift));
+            }
+            if (new_freq >= 2048u) {
+                pulse->enabled = 0;
+            } else {
+                pulse->sweep_shadow_freq = new_freq;
+                pulse->frequency_raw = new_freq;
+                gbc->memory[0xFF13] = (uint8_t)(new_freq & 0xFFu);
+                gbc->memory[0xFF14] = (uint8_t)((gbc->memory[0xFF14] & 0xF8u) | ((new_freq >> 8) & 0x07u));
+                /* Overflow check with updated shadow */
+                if (shift != 0) {
+                    uint16_t check;
+                    if (nr10 & 0x08) {
+                        check = (uint16_t)(new_freq - (new_freq >> shift));
+                    } else {
+                        check = (uint16_t)(new_freq + (new_freq >> shift));
+                    }
+                    if (check >= 2048u) {
+                        pulse->enabled = 0;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void pyemu_gbc_update_noise_state_for_frame(pyemu_gbc_system* gbc) {
     pyemu_gbc_noise_channel* noise = &gbc->noise;
 
@@ -89,9 +169,34 @@ static void pyemu_gbc_trigger_pulse(pyemu_gbc_system* gbc, int channel) {
 
     pulse->duty = (uint8_t)(length_reg >> 6);
     pulse->volume = (uint8_t)((envelope >> 4) & 0x0F);
+    pulse->envelope_period = (uint8_t)(envelope & 0x07);
+    pulse->envelope_increase = (uint8_t)((envelope >> 3) & 0x01);
+    pulse->envelope_cycles = 0;
     pulse->frequency_raw = pyemu_gbc_channel_frequency_raw(gbc, channel);
-    pulse->enabled = pulse->volume > 0 ? 1 : 0;
+    pulse->enabled = ((envelope & 0xF8) != 0) ? 1 : 0;
     pulse->phase = 0.0f;
+
+    if (channel == 1) {
+        uint8_t nr10 = gbc->memory[0xFF10];
+        uint8_t period = (uint8_t)((nr10 >> 4) & 0x07);
+        uint8_t shift  = (uint8_t)(nr10 & 0x07);
+        pulse->sweep_shadow_freq = pulse->frequency_raw;
+        pulse->sweep_timer   = period ? period : 8u;
+        pulse->sweep_enabled = (period != 0 || shift != 0) ? 1u : 0u;
+        pulse->sweep_cycles  = 0;
+        /* Overflow check on trigger */
+        if (pulse->enabled && shift != 0) {
+            uint16_t check;
+            if (nr10 & 0x08) {
+                check = pulse->sweep_shadow_freq - (pulse->sweep_shadow_freq >> shift);
+            } else {
+                check = pulse->sweep_shadow_freq + (pulse->sweep_shadow_freq >> shift);
+            }
+            if (check >= 2048u) {
+                pulse->enabled = 0;
+            }
+        }
+    }
 }
 
 static void pyemu_gbc_trigger_wave(pyemu_gbc_system* gbc) {
@@ -142,8 +247,9 @@ void pyemu_gbc_apu_handle_write(pyemu_gbc_system* gbc, uint16_t address, uint8_t
             gbc->pulse1.duty = (uint8_t)(value >> 6);
             break;
         case 0xFF12:
-            gbc->pulse1.volume = (uint8_t)((value >> 4) & 0x0F);
-            if (gbc->pulse1.volume == 0) gbc->pulse1.enabled = 0;
+            gbc->pulse1.envelope_period   = (uint8_t)(value & 0x07);
+            gbc->pulse1.envelope_increase = (uint8_t)((value >> 3) & 0x01);
+            if ((value & 0xF8) == 0) gbc->pulse1.enabled = 0;
             break;
         case 0xFF13:
             gbc->pulse1.frequency_raw = pyemu_gbc_channel_frequency_raw(gbc, 1);
@@ -158,8 +264,9 @@ void pyemu_gbc_apu_handle_write(pyemu_gbc_system* gbc, uint16_t address, uint8_t
             gbc->pulse2.duty = (uint8_t)(value >> 6);
             break;
         case 0xFF17:
-            gbc->pulse2.volume = (uint8_t)((value >> 4) & 0x0F);
-            if (gbc->pulse2.volume == 0) gbc->pulse2.enabled = 0;
+            gbc->pulse2.envelope_period   = (uint8_t)(value & 0x07);
+            gbc->pulse2.envelope_increase = (uint8_t)((value >> 3) & 0x01);
+            if ((value & 0xF8) == 0) gbc->pulse2.enabled = 0;
             break;
         case 0xFF18:
             gbc->pulse2.frequency_raw = pyemu_gbc_channel_frequency_raw(gbc, 2);
@@ -231,19 +338,23 @@ void pyemu_gbc_update_audio_frame(pyemu_gbc_system* gbc) {
         return;
     }
 
+    /* Duty can change without a trigger, so always re-read it.
+     * Volume and frequency are managed by trigger + envelope + sweep; do NOT
+     * overwrite them from registers here.  DAC-off check: if the upper 5 bits
+     * of the envelope register are all zero the DAC is disabled. */
     gbc->pulse1.duty = (uint8_t)(gbc->memory[0xFF11] >> 6);
-    gbc->pulse1.volume = (uint8_t)((gbc->memory[0xFF12] >> 4) & 0x0F);
-    gbc->pulse1.frequency_raw = pyemu_gbc_channel_frequency_raw(gbc, 1);
-    if ((gbc->memory[0xFF12] & 0xF8) == 0 || gbc->pulse1.volume == 0) {
+    if ((gbc->memory[0xFF12] & 0xF8) == 0) {
         gbc->pulse1.enabled = 0;
     }
 
     gbc->pulse2.duty = (uint8_t)(gbc->memory[0xFF16] >> 6);
-    gbc->pulse2.volume = (uint8_t)((gbc->memory[0xFF17] >> 4) & 0x0F);
-    gbc->pulse2.frequency_raw = pyemu_gbc_channel_frequency_raw(gbc, 2);
-    if ((gbc->memory[0xFF17] & 0xF8) == 0 || gbc->pulse2.volume == 0) {
+    if ((gbc->memory[0xFF17] & 0xF8) == 0) {
         gbc->pulse2.enabled = 0;
     }
+
+    pyemu_gbc_update_pulse_envelope(&gbc->pulse1);
+    pyemu_gbc_update_pulse_envelope(&gbc->pulse2);
+    pyemu_gbc_update_pulse1_sweep(gbc);
 
     gbc->wave.volume_code = (uint8_t)((gbc->memory[0xFF1C] >> 5) & 0x03);
     gbc->wave.frequency_raw = pyemu_gbc_wave_frequency_raw(gbc);

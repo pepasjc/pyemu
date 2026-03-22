@@ -141,9 +141,11 @@ void pyemu_gbc_refresh_rom_mapping(pyemu_gbc_system* gbc) {
 }
 
 void pyemu_gbc_refresh_eram_window(pyemu_gbc_system* gbc) {
-    size_t offset = pyemu_gbc_current_eram_offset(gbc);
-    if (gbc->eram_size > 0) {
+    if (gbc->eram_size > 0 && gbc->ram_enabled) {
+        size_t offset = pyemu_gbc_current_eram_offset(gbc);
         memcpy(gbc->memory + 0xA000, gbc->eram + offset, PYEMU_GBC_ERAM_BANK_SIZE);
+    } else {
+        memset(gbc->memory + 0xA000, 0xFF, PYEMU_GBC_ERAM_BANK_SIZE);
     }
 }
 
@@ -589,28 +591,25 @@ void pyemu_gbc_tick(pyemu_gbc_system* gbc, int cycles) {
     int ticks = gbc->double_speed ? (cycles * 2) : cycles;
     uint32_t old_div_counter = gbc->div_counter;
     uint8_t tac = gbc->memory[PYEMU_IO_TAC];
-    int remaining_cycles = ticks;
+    /* PPU always runs at single-speed (4.19 MHz) regardless of CPU double-speed.
+       CPU, timers and DIV advance at double rate in double speed (ticks = 2*cycles). */
+    int remaining_cycles = cycles;
 
     gbc->cycle_count += (uint64_t)ticks;
     gbc->div_counter += (uint32_t)ticks;
     gbc->memory[PYEMU_IO_DIV] = (uint8_t)((gbc->div_counter >> 8) & 0xFF);
 
-    /* Serial transfer: simulate a virtual link-cable partner.
-     * When SC bit 7 (transfer start) is set:
-     *   Internal clock (SC=0x81): complete after 4096 cycles.
-     *   External clock (SC=0x80): complete after 8192 cycles timeout.
-     * On completion: SB is set to the partner's reply byte, SC bit 7 clears,
-     * serial IRQ fires.
+    /* Serial transfer: no link cable connected.
+     * When SC bit 7 (transfer start) is set, simulate a timed-out transfer:
+     *   Internal clock (SC bit 0 = 1): complete after 4096 cycles.
+     *   External clock (SC bit 0 = 0): complete after 8192 cycles timeout.
+     * On completion: SB = 0xFF (all bits high from pull-up resistors),
+     * SC bit 7 clears, serial IRQ fires.
      *
-     * Protocol-aware reply table (Tetris DX link handshake):
-     *   $DD -> $DD  (initial link detect handshake)
-     *   $F0 -> $F0  (1P lobby broadcast; game advances C0A8 3->4)
-     *   $FE -> $10  (C0A8=4 probe: reply $10 = 1-player confirmation)
-     *   $10 -> $10  (C0A8=4 D20C=0 re-dispatch; acknowledge 1P)
-     *   $0E -> $0E  (game-start signal)
-     *   $0F -> $0F  (game-start signal)
-     *   $FF -> $FF  (generic ack)
-     *   everything else -> echo (SB unchanged)
+     * Returning 0xFF matches real GBC hardware with no cable attached.
+     * Games that work in single-player mode detect 0xFF as "no partner" and
+     * proceed normally.  Games requiring a cable (2-player link games) will
+     * simply not establish a connection, which is the correct behaviour.
      */
     if (gbc->memory[0xFF02] & 0x80) {
         uint32_t timeout = (gbc->memory[0xFF02] & 0x01) ? 4096u : 8192u;
@@ -619,14 +618,7 @@ void pyemu_gbc_tick(pyemu_gbc_system* gbc, int cycles) {
         }
         if (gbc->serial_counter <= (uint32_t)ticks) {
             gbc->serial_counter = 0;
-            /* Compute the partner's reply byte */
-            uint8_t sent = gbc->memory[0xFF01];
-            uint8_t reply;
-            switch (sent) {
-                case 0xFE: reply = 0x10; break; /* 1-player confirmation */
-                default:   reply = sent;  break; /* echo everything else */
-            }
-            gbc->memory[0xFF01] = reply;
+            gbc->memory[0xFF01] = 0xFF; /* No cable: received byte = 0xFF (pull-up) */
             gbc->memory[0xFF02] &= (uint8_t)~0x80; /* Clear SC bit 7: transfer complete */
             pyemu_gbc_request_interrupt(gbc, PYEMU_INTERRUPT_SERIAL);
         } else {

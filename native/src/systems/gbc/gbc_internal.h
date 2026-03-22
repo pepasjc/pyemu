@@ -62,7 +62,7 @@
 #define PYEMU_FLAG_H 0x20
 #define PYEMU_FLAG_C 0x10
 #define PYEMU_GBC_STATE_MAGIC 0x50474354U
-#define PYEMU_GBC_STATE_VERSION 2U
+#define PYEMU_GBC_STATE_VERSION 3U
 #define PYEMU_GBC_BLOCK_CACHE_SIZE 8192
 #define PYEMU_GBC_BLOCK_MAX_INSNS 16
 #define PYEMU_GBC_AUDIO_SAMPLE_RATE 48000
@@ -123,6 +123,15 @@ typedef struct pyemu_gbc_pulse_channel {
     uint8_t volume;
     uint16_t frequency_raw;
     float phase;
+    /* Envelope */
+    uint8_t envelope_period;
+    uint8_t envelope_increase;
+    uint32_t envelope_cycles;
+    /* Sweep (channel 1 only) */
+    uint16_t sweep_shadow_freq;
+    uint8_t sweep_timer;
+    uint8_t sweep_enabled;
+    uint32_t sweep_cycles;
 } pyemu_gbc_pulse_channel;
 
 typedef struct pyemu_gbc_wave_channel {
@@ -262,6 +271,9 @@ typedef struct pyemu_gbc_state_file {
     pyemu_gbc_palette sp_palettes[8];
     uint8_t current_vbk;
     uint8_t current_wram_bank;
+    uint8_t bg_palette_index;
+    uint8_t sp_palette_index;
+    int ime_delay;
     char loaded_rom[260];
     char cartridge_title[17];
     size_t rom_size;
