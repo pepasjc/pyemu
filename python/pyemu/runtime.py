@@ -511,6 +511,10 @@ class Emulator:
         return getattr(self._backend, "native_library_path", "")
 
     @property
+    def native_core_library_paths(self) -> tuple[str, ...]:
+        return getattr(self._backend, "native_core_library_paths", ())
+
+    @property
     def faulted(self) -> bool:
         return self._backend.faulted
 
@@ -637,6 +641,18 @@ class _NativeEmulator:
     @property
     def native_library_path(self) -> str:
         return self._library_path
+
+    @property
+    def native_core_library_paths(self) -> tuple[str, ...]:
+        library_path = Path(self._library_path)
+        if not library_path.exists():
+            return ()
+        pattern = "*.dll" if sys.platform.startswith("win") else "pyemu_core_*"
+        return tuple(
+            str(candidate)
+            for candidate in sorted(library_path.parent.glob(pattern))
+            if candidate.name.startswith("pyemu_core_")
+        )
 
     @property
     def system_name(self) -> str:
@@ -1171,8 +1187,11 @@ def _library_candidates() -> list[Path]:
     workspace_root = package_root.parent.parent
     if sys.platform.startswith("win"):
         return [
-            workspace_root / "build" / "native" / "pyemu_native_timed167.dll",
-            workspace_root / "build" / "native" / "pyemu_native_timed166.dll",
+            workspace_root / "native" / "build" / "native" / "pyemu_native.dll",
+            workspace_root / "build" / "native" / "pyemu_native.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed170.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed169.dll",
+            workspace_root / "build" / "native" / "pyemu_native_timed168.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed165.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed141.dll",
             workspace_root / "build" / "native" / "pyemu_native_timed164.dll",

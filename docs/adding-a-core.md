@@ -48,16 +48,17 @@ Strong recommendation:
 - make `step_frame` the user-facing fast path
 - keep reset/load/save-state logic outside the main execution file if possible
 
-## 3. Register the system
+## 3. Export the core plugin
 
-Add the new key to the registry in:
-- [native/src/core/emulator.c](E:/projects/pyemu/native/src/core/emulator.c)
+Add a small plugin source file for the system that exports a descriptor through:
+- [native/include/pyemu/core/plugin.h](E:/projects/pyemu/native/include/pyemu/core/plugin.h)
 
 Example shape:
 - system key: `"nes"`
 - create function: `pyemu_nes_create`
+- optional debugger/input helpers for audio channels, input, and bus tracking
 
-That immediately makes it visible through the generic C API.
+The host DLL discovers these per-core plugin DLLs at runtime, so new systems no longer need a hardcoded registry entry in `emulator.c`.
 
 ## 4. Add Python metadata
 
@@ -72,7 +73,7 @@ You need:
 - frame rate
 - media label and extensions
 
-Once that exists, Python can construct `Emulator('<key>')` generically.
+Once that exists, Python can construct `Emulator('<key>')` generically as long as the matching core DLL is present beside the host DLL.
 
 ## 5. Keep the first UI pass generic
 

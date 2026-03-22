@@ -3,7 +3,8 @@
 `pyemu` is an educational emulator project with a native core in C and a Python-first debugger/UI.
 
 The current system is the Nintendo Game Boy, but the project is structured as a multi-core framework:
-- a stable native emulator handle in C
+- a stable native host DLL in C
+- per-system core DLLs discovered by that host at runtime
 - per-system implementations behind a `pyemu_system_vtable`
 - a Python runtime layer via `cffi`
 - a desktop debugger built with `PySide6` and a pluggable display backend
@@ -77,13 +78,16 @@ uv run python scripts/regression_smoke.py
 
 ## Native build notes
 
-The Python runtime loads the newest known-good native DLL from `build/native/` on Windows.
+The native side now builds into:
+- `native/build/native/pyemu_native.dll`
+  - stable host DLL loaded by Python
+- `native/build/native/pyemu_core_<system>.dll`
+  - per-core plugin DLLs discovered by the host at runtime
 
-A direct local build command we use frequently is:
+Build from the workspace root with:
 
 ```powershell
-gcc -shared -O2 -std=c11 -Wall -Wextra -DPYEMU_BUILD_DLL -I native\include native\src\core\emulator.c native\src\systems\gameboy\gameboy_system.c -o build
-ative\pyemu_native_timed110.dll
+cmake --build build
 ```
 
 ## Design goals

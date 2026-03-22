@@ -1,46 +1,38 @@
 #include "pyemu/core/emulator.h"
+#include "pyemu/core/plugin.h"
 
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
-#include "pyemu/core/system.h"
-#include "pyemu/systems/gameboy/gameboy_system.h"
-#include "pyemu/systems/gbc/gbc_system.h"
+#if defined(_WIN32)
+#include <windows.h>
+typedef HMODULE pyemu_core_module_handle;
+#else
+#include <dirent.h>
+#include <dlfcn.h>
+#include <limits.h>
+typedef void* pyemu_core_module_handle;
+#endif
 
 struct pyemu_emulator {
     pyemu_system* system;
     pyemu_run_state run_state;
+    const pyemu_core_plugin_descriptor* plugin;
 };
 
-typedef struct pyemu_system_descriptor {
-    const char* key;
-    pyemu_system* (*create)(void);
-} pyemu_system_descriptor;
+typedef struct pyemu_loaded_core {
+    pyemu_core_module_handle module;
+    const pyemu_core_plugin_descriptor* descriptor;
+} pyemu_loaded_core;
 
-static const pyemu_system_descriptor PYEMU_SYSTEMS[] = {
-    {"gameboy", pyemu_gameboy_create},
-    {"gbc", pyemu_gbc_create}
-};
+#define PYEMU_MAX_CORES 32
+#define PYEMU_PLUGIN_DIR_BUFFER 1024
 
-static const size_t PYEMU_SYSTEM_COUNT = sizeof(PYEMU_SYSTEMS) / sizeof(PYEMU_SYSTEMS[0]);
-
-static const pyemu_system_descriptor* pyemu_find_system_descriptor(const char* system_key) {
-    size_t index;
-    const char* requested = system_key;
-
-    if (requested == NULL || requested[0] == '\0') {
-        requested = PYEMU_SYSTEMS[0].key;
-    }
-
-    for (index = 0; index < PYEMU_SYSTEM_COUNT; ++index) {
-        if (strcmp(PYEMU_SYSTEMS[index].key, requested) == 0) {
-            return &PYEMU_SYSTEMS[index];
-        }
-    }
-
-    return NULL;
-}
+static pyemu_loaded_core PYEMU_LOADED_CORES[PYEMU_MAX_CORES];
+static size_t PYEMU_LOADED_CORE_COUNT = 0;
+static int PYEMU_CORE_SCAN_COMPLETE = 0;
 
 static pyemu_cpu_state pyemu_zero_cpu_state(void) {
     pyemu_cpu_state state;
@@ -92,23 +84,244 @@ static pyemu_audio_buffer pyemu_zero_audio_buffer(void) {
     return audio;
 }
 
+static int pyemu_has_loaded_core_key(const char* key) {
+    size_t index;
+    for (index = 0; index < PYEMU_LOADED_CORE_COUNT; ++index) {
+        if (strcmp(PYEMU_LOADED_CORES[index].descriptor->key, key) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pyemu_register_loaded_core(pyemu_core_module_handle module, const pyemu_core_plugin_descriptor* descriptor) {
+    if (descriptor == NULL || descriptor->key == NULL || descriptor->key[0] == '\0' || descriptor->create == NULL) {
+        return;
+    }
+    if (PYEMU_LOADED_CORE_COUNT >= PYEMU_MAX_CORES || pyemu_has_loaded_core_key(descriptor->key)) {
+        return;
+    }
+    PYEMU_LOADED_CORES[PYEMU_LOADED_CORE_COUNT].module = module;
+    PYEMU_LOADED_CORES[PYEMU_LOADED_CORE_COUNT].descriptor = descriptor;
+    PYEMU_LOADED_CORE_COUNT += 1;
+}
+
+#if defined(_WIN32)
+static int pyemu_get_host_directory(char* out_directory, size_t out_size) {
+    HMODULE module = NULL;
+    DWORD length;
+    char path[PYEMU_PLUGIN_DIR_BUFFER];
+    char* slash;
+
+    if (out_directory == NULL || out_size == 0) {
+        return 0;
+    }
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&pyemu_get_supported_system_count,
+            &module)) {
+        return 0;
+    }
+    length = GetModuleFileNameA(module, path, (DWORD)sizeof(path));
+    if (length == 0 || length >= sizeof(path)) {
+        return 0;
+    }
+    slash = strrchr(path, '\\');
+    if (slash == NULL) {
+        return 0;
+    }
+    *slash = '\0';
+    strncpy(out_directory, path, out_size - 1);
+    out_directory[out_size - 1] = '\0';
+    return 1;
+}
+
+static void pyemu_try_load_core_library(const char* full_path) {
+    pyemu_core_module_handle module;
+    pyemu_get_core_plugin_fn get_plugin;
+    const pyemu_core_plugin_descriptor* descriptor;
+
+    module = LoadLibraryA(full_path);
+    if (module == NULL) {
+        return;
+    }
+    get_plugin = (pyemu_get_core_plugin_fn)GetProcAddress(module, PYEMU_CORE_PLUGIN_EXPORT_NAME);
+    if (get_plugin == NULL) {
+        FreeLibrary(module);
+        return;
+    }
+    descriptor = get_plugin();
+    if (descriptor == NULL || descriptor->key == NULL || descriptor->create == NULL || pyemu_has_loaded_core_key(descriptor->key)) {
+        FreeLibrary(module);
+        return;
+    }
+    pyemu_register_loaded_core(module, descriptor);
+}
+
+static void pyemu_scan_core_directory(const char* directory) {
+    char pattern[PYEMU_PLUGIN_DIR_BUFFER];
+    WIN32_FIND_DATAA find_data;
+    HANDLE handle;
+
+    if (snprintf(pattern, sizeof(pattern), "%s\\pyemu_core_*.dll", directory) < 0) {
+        return;
+    }
+    handle = FindFirstFileA(pattern, &find_data);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        if ((find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            char full_path[PYEMU_PLUGIN_DIR_BUFFER];
+            if (snprintf(full_path, sizeof(full_path), "%s\\%s", directory, find_data.cFileName) >= 0) {
+                pyemu_try_load_core_library(full_path);
+            }
+        }
+    } while (FindNextFileA(handle, &find_data) != 0);
+
+    FindClose(handle);
+}
+#else
+static int pyemu_plugin_name_matches(const char* filename) {
+    size_t length;
+    if (filename == NULL) {
+        return 0;
+    }
+    if (strncmp(filename, "pyemu_core_", 11) != 0) {
+        return 0;
+    }
+    length = strlen(filename);
+#if defined(__APPLE__)
+    return length > 6 && strcmp(filename + length - 6, ".dylib") == 0;
+#else
+    return length > 3 && strcmp(filename + length - 3, ".so") == 0;
+#endif
+}
+
+static int pyemu_get_host_directory(char* out_directory, size_t out_size) {
+    Dl_info info;
+    char path[PYEMU_PLUGIN_DIR_BUFFER];
+    char* slash;
+
+    if (out_directory == NULL || out_size == 0) {
+        return 0;
+    }
+    if (dladdr((void*)&pyemu_get_supported_system_count, &info) == 0 || info.dli_fname == NULL) {
+        return 0;
+    }
+    strncpy(path, info.dli_fname, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    slash = strrchr(path, '/');
+    if (slash == NULL) {
+        return 0;
+    }
+    *slash = '\0';
+    strncpy(out_directory, path, out_size - 1);
+    out_directory[out_size - 1] = '\0';
+    return 1;
+}
+
+static void pyemu_try_load_core_library(const char* full_path) {
+    pyemu_core_module_handle module;
+    pyemu_get_core_plugin_fn get_plugin;
+    const pyemu_core_plugin_descriptor* descriptor;
+
+    module = dlopen(full_path, RTLD_NOW);
+    if (module == NULL) {
+        return;
+    }
+    get_plugin = (pyemu_get_core_plugin_fn)dlsym(module, PYEMU_CORE_PLUGIN_EXPORT_NAME);
+    if (get_plugin == NULL) {
+        dlclose(module);
+        return;
+    }
+    descriptor = get_plugin();
+    if (descriptor == NULL || descriptor->key == NULL || descriptor->create == NULL || pyemu_has_loaded_core_key(descriptor->key)) {
+        dlclose(module);
+        return;
+    }
+    pyemu_register_loaded_core(module, descriptor);
+}
+
+static void pyemu_scan_core_directory(const char* directory) {
+    DIR* dir;
+    struct dirent* entry;
+
+    dir = opendir(directory);
+    if (dir == NULL) {
+        return;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (pyemu_plugin_name_matches(entry->d_name)) {
+            char full_path[PYEMU_PLUGIN_DIR_BUFFER];
+            if (snprintf(full_path, sizeof(full_path), "%s/%s", directory, entry->d_name) >= 0) {
+                pyemu_try_load_core_library(full_path);
+            }
+        }
+    }
+
+    closedir(dir);
+}
+#endif
+
+static void pyemu_ensure_core_plugins_loaded(void) {
+    char directory[PYEMU_PLUGIN_DIR_BUFFER];
+    if (PYEMU_CORE_SCAN_COMPLETE) {
+        return;
+    }
+    PYEMU_CORE_SCAN_COMPLETE = 1;
+    if (!pyemu_get_host_directory(directory, sizeof(directory))) {
+        return;
+    }
+    pyemu_scan_core_directory(directory);
+}
+
+static const pyemu_core_plugin_descriptor* pyemu_find_core_plugin(const char* system_key) {
+    size_t index;
+    const char* requested = system_key;
+
+    pyemu_ensure_core_plugins_loaded();
+
+    if (requested == NULL || requested[0] == '\0') {
+        requested = pyemu_get_default_system_key();
+    }
+
+    for (index = 0; index < PYEMU_LOADED_CORE_COUNT; ++index) {
+        if (strcmp(PYEMU_LOADED_CORES[index].descriptor->key, requested) == 0) {
+            return PYEMU_LOADED_CORES[index].descriptor;
+        }
+    }
+
+    return NULL;
+}
+
 PYEMU_API size_t pyemu_get_supported_system_count(void) {
-    return PYEMU_SYSTEM_COUNT;
+    pyemu_ensure_core_plugins_loaded();
+    return PYEMU_LOADED_CORE_COUNT;
 }
 
 PYEMU_API const char* pyemu_get_supported_system_key(size_t index) {
-    if (index >= PYEMU_SYSTEM_COUNT) {
+    pyemu_ensure_core_plugins_loaded();
+    if (index >= PYEMU_LOADED_CORE_COUNT) {
         return "";
     }
-    return PYEMU_SYSTEMS[index].key;
+    return PYEMU_LOADED_CORES[index].descriptor->key;
 }
 
 PYEMU_API const char* pyemu_get_default_system_key(void) {
-    return PYEMU_SYSTEMS[0].key;
+    size_t index;
+    pyemu_ensure_core_plugins_loaded();
+    for (index = 0; index < PYEMU_LOADED_CORE_COUNT; ++index) {
+        if (strcmp(PYEMU_LOADED_CORES[index].descriptor->key, "gameboy") == 0) {
+            return PYEMU_LOADED_CORES[index].descriptor->key;
+        }
+    }
+    return PYEMU_LOADED_CORE_COUNT > 0 ? PYEMU_LOADED_CORES[0].descriptor->key : "";
 }
 
 PYEMU_API pyemu_emulator* pyemu_create_emulator(const char* system_key) {
-    const pyemu_system_descriptor* descriptor = pyemu_find_system_descriptor(system_key);
+    const pyemu_core_plugin_descriptor* descriptor = pyemu_find_core_plugin(system_key);
     pyemu_emulator* emulator;
 
     if (descriptor == NULL) {
@@ -126,6 +339,7 @@ PYEMU_API pyemu_emulator* pyemu_create_emulator(const char* system_key) {
         return NULL;
     }
 
+    emulator->plugin = descriptor;
     emulator->run_state = PYEMU_RUN_STATE_STOPPED;
     return emulator;
 }
@@ -314,16 +528,10 @@ PYEMU_API uint64_t pyemu_get_cycle_count(const pyemu_emulator* emulator) {
 }
 
 PYEMU_API pyemu_audio_buffer pyemu_get_gameboy_audio_channel_buffer(const pyemu_emulator* emulator, int channel) {
-    if (emulator == NULL || emulator->system == NULL) {
+    if (emulator == NULL || emulator->system == NULL || emulator->plugin == NULL || emulator->plugin->get_audio_channel_buffer == NULL) {
         return pyemu_zero_audio_buffer();
     }
-    const char* name = emulator->system->vtable->name(emulator->system);
-    if (strcmp(name, "gameboy") == 0) {
-        return pyemu_gameboy_get_audio_channel_buffer(emulator->system, channel);
-    } else if (strcmp(name, "gbc") == 0) {
-        return pyemu_gbc_get_audio_channel_buffer(emulator->system, channel);
-    }
-    return pyemu_zero_audio_buffer();
+    return emulator->plugin->get_audio_channel_buffer(emulator->system, channel);
 }
 
 PYEMU_API int pyemu_get_gameboy_audio_debug_info(const pyemu_emulator* emulator, pyemu_gameboy_audio_debug_info* out_info) {
@@ -331,50 +539,38 @@ PYEMU_API int pyemu_get_gameboy_audio_debug_info(const pyemu_emulator* emulator,
         return 0;
     }
     memset(out_info, 0, sizeof(*out_info));
-    if (emulator == NULL || emulator->system == NULL) {
+    if (emulator == NULL || emulator->system == NULL || emulator->plugin == NULL || emulator->plugin->get_audio_debug_info == NULL) {
         return 0;
     }
-    const char* name = emulator->system->vtable->name(emulator->system);
-    if (strcmp(name, "gameboy") == 0) {
-        pyemu_gameboy_get_audio_debug_info(emulator->system, out_info);
-        return 1;
-    } else if (strcmp(name, "gbc") == 0) {
-        pyemu_gbc_get_audio_debug_info(emulator->system, out_info);
-        return 1;
-    }
-    return 0;
+    emulator->plugin->get_audio_debug_info(emulator->system, out_info);
+    return 1;
 }
 
 PYEMU_API void pyemu_set_gameboy_joypad_state(pyemu_emulator* emulator, uint8_t buttons, uint8_t directions) {
-    if (emulator == NULL || emulator->system == NULL) {
+    if (emulator == NULL || emulator->system == NULL || emulator->plugin == NULL || emulator->plugin->set_joypad_state == NULL) {
         return;
     }
-    if (strcmp(emulator->system->vtable->name(emulator->system), "gameboy") != 0) {
+    if (strcmp(emulator->plugin->key, "gameboy") != 0) {
         return;
     }
-    pyemu_gameboy_set_joypad_state(emulator->system, buttons, directions);
+    emulator->plugin->set_joypad_state(emulator->system, buttons, directions);
 }
 
 PYEMU_API void pyemu_set_gbc_joypad_state(pyemu_emulator* emulator, uint8_t buttons, uint8_t directions) {
-    if (emulator == NULL || emulator->system == NULL) {
+    if (emulator == NULL || emulator->system == NULL || emulator->plugin == NULL || emulator->plugin->set_joypad_state == NULL) {
         return;
     }
-    if (strcmp(emulator->system->vtable->name(emulator->system), "gbc") != 0) {
+    if (strcmp(emulator->plugin->key, "gbc") != 0) {
         return;
     }
-    pyemu_gbc_set_joypad_state(emulator->system, buttons, directions);
+    emulator->plugin->set_joypad_state(emulator->system, buttons, directions);
 }
 
 PYEMU_API void pyemu_set_bus_tracking(pyemu_emulator* emulator, int enabled) {
-    if (emulator == NULL || emulator->system == NULL) {
+    if (emulator == NULL || emulator->system == NULL || emulator->plugin == NULL || emulator->plugin->set_bus_tracking == NULL) {
         return;
     }
-    const char* name = emulator->system->vtable->name(emulator->system);
-    if (strcmp(name, "gameboy") == 0) {
-        pyemu_gameboy_set_bus_tracking(emulator->system, enabled);
-    } else if (strcmp(name, "gbc") == 0) {
-        pyemu_gbc_set_bus_tracking(emulator->system, enabled);
-    }
+    emulator->plugin->set_bus_tracking(emulator->system, enabled);
 }
 
 PYEMU_API int pyemu_is_faulted(const pyemu_emulator* emulator) {

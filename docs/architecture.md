@@ -15,7 +15,8 @@ The implementation lives in:
 - [native/src/core/emulator.c](E:/projects/pyemu/native/src/core/emulator.c)
 
 Important responsibilities:
-- system registration and lookup
+- discovering core DLL plugins at startup
+- looking up a system key in the loaded plugin descriptors
 - forwarding API calls into the selected system vtable
 - returning zero/default structs when no system is active
 
@@ -31,6 +32,11 @@ Every core implements a `pyemu_system_vtable` with these categories:
 - status: ROM loaded, cycle count, fault state
 
 This is the main extension seam for adding new consoles.
+
+Core DLL plugins export a descriptor through:
+- [native/include/pyemu/core/plugin.h](E:/projects/pyemu/native/include/pyemu/core/plugin.h)
+
+The host DLL discovers those plugins at runtime, so new cores no longer need to be statically registered in `emulator.c`.
 
 ## 3. System implementation
 
@@ -132,8 +138,8 @@ flowchart LR
 ## Current extension points
 
 If we add another system, these are the intended seams:
-- register a new system key in [native/src/core/emulator.c](E:/projects/pyemu/native/src/core/emulator.c)
 - implement a new `pyemu_system_vtable`
+- export a plugin descriptor from a per-core DLL via [native/include/pyemu/core/plugin.h](E:/projects/pyemu/native/include/pyemu/core/plugin.h)
 - add a `SystemInfo` entry in [python/pyemu/runtime.py](E:/projects/pyemu/python/pyemu/runtime.py)
 - keep the UI generic and only add system-specific panels when necessary
 

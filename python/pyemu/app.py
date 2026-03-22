@@ -1592,10 +1592,12 @@ class EmulatorWindow(QMainWindow):
 
             self._update_performance_label()
             wait_note = self._describe_wait_state(memory, state, media)
+            core_dlls = [Path(path).name for path in self.emulator.native_core_library_paths]
             status_lines = [
                 f"System: {self.emulator.system.display_name}",
                 f"Native backend: {'yes' if self.emulator.native_available else 'no'}",
                 f"Native DLL: {Path(self.emulator.native_library_path).name if self.emulator.native_library_path else 'fallback'}",
+                f"Core DLLs: {', '.join(core_dlls) if core_dlls else 'none'}",
                 f"Run state: {self.emulator.run_state.name}",
                 f"Target FPS: {self.emulator.system.frame_rate:.3f}",
                 f"CPU halted: {'yes' if state.halted else 'no'}",
